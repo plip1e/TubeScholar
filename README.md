@@ -1,10 +1,10 @@
 # 🎓 TubeScholar
 
-> A trustworthy research assistant for YouTube — not just another summarizer.
+> A trustworthy research assistant for YouTube, not just another summarizer.
 
-TubeScholar turns YouTube videos into a **queryable, source-aware knowledge base**. Ask a question, get an answer grounded in the actual transcript — *plus* a transparent trust signal that tells you how much you should rely on the source it came from.
+TubeScholar turns YouTube videos into a **queryable, source-aware knowledge base**. Ask a question, get an answer grounded in the actual transcript, *plus* a transparent trust signal that tells you how much you should rely on the source it came from.
 
-The name is intentional: **Tube**(YouTube) + **Scholar**(Google Scholar) — a serious research and education tool, not a TL;DR machine.
+The name is intentional: **Tube**(YouTube) + **Scholar**(Google Scholar), a serious research and education tool, not a TL;DR machine.
 
 ---
 
@@ -20,9 +20,9 @@ TubeScholar's whole reason to exist is the layer most tools skip: **should you t
 
 Every answer carries a trust assessment built from three combined signals:
 
-- **Credential checking** — does the speaker/channel have relevant authority on the topic?
-- **Channel reputation scoring** — track record, signals of reliability vs. red flags.
-- **AI claim confidence** — how well-supported is the specific claim by the retrieved context?
+- **Credential checking**, does the speaker/channel have relevant authority on the topic?
+- **Channel reputation scoring**, track record, signals of reliability vs. red flags.
+- **AI claim confidence**, how well-supported is the specific claim by the retrieved context?
 
 These are blended into a nuanced trust model and surfaced **transparently** alongside the response, so the user sees the reasoning, not just a number.
 
@@ -40,7 +40,7 @@ These are blended into a nuanced trust model and surfaced **transparently** alon
 
 ## 🏗️ Architecture
 
-TubeScholar is a **multi-agent system** built on a LangGraph `StateGraph`. A supervisor node routes user intent to the right path — retrieval, trust scoring, or other handling — rather than running everything through a single monolithic chain.
+TubeScholar is a **multi-agent system** built on a LangGraph `StateGraph`. A supervisor node routes user intent to the right path, retrieval, trust scoring, or other handling, rather than running everything through a single monolithic chain.
 
 ```
 User query
@@ -69,7 +69,7 @@ Transcripts are ingested via `youtube-transcript-api`, with an `openai-whisper` 
 | Layer | Choice |
 |-------|--------|
 | **Orchestration** | LangGraph + LangChain |
-| **LLM** | `gemini-2.5-flash-lite` (main app), `gemini-2.5-flash` (heavier nodes — supervisor, trust scorer) |
+| **LLM** | `gemini-2.5-flash-lite` (main app), `gemini-2.5-flash` (heavier nodes, supervisor, trust scorer) |
 | **Embeddings** | `models/gemini-embedding-001` |
 | **Vector store** | ChromaDB |
 | **Transcripts** | `youtube-transcript-api` + `openai-whisper` (CPU fallback) |
@@ -85,7 +85,7 @@ Transcripts are ingested via `youtube-transcript-api`, with an `openai-whisper` 
 ### Prerequisites
 
 - Python 3.10+
-- A Google Gemini API key ([Google AI Studio](https://aistudio.google.com/) — free tier is fine for development)
+- A Google Gemini API key ([Google AI Studio](https://aistudio.google.com/), free tier is fine for development)
 - A YouTube Data API v3 key
 - (Optional) webshare.io credentials for rotating proxies
 - (Optional) A LangSmith API key for tracing/evaluation
@@ -129,18 +129,12 @@ Then open the Gradio link in your browser.
 Evaluation is treated as a **first-class signal**, not an afterthought.
 
 - Runs are versioned (`rag-v1`, `rag-v2`, …) and tracked in **LangSmith**.
-- A custom **Gemini-as-judge** `RAGEvaluator` scores faithfulness, relevance, and answer quality. *(RAGAS was dropped — incompatible with the modern LangChain stack.)*
+- A custom **Gemini-as-judge** `RAGEvaluator` scores faithfulness, relevance, and answer quality. *(RAGAS was dropped, incompatible with the modern LangChain stack.)*
 - The evaluator calls the vector store directly (bypassing the graph) to avoid LangChain format-string errors from curly braces in transcript chunks.
 
 ---
 
 ## 🗺️ Roadmap
-
-**Pipeline improvements (next up)**
-- [ ] Bump retrieval `k` to 5–6 (list-type questions hit a recall ceiling at k=3)
-- [ ] Integrate `MultiQueryRetriever` into the `other_intent` node
-- [ ] Tighten the system prompt so partial-context existence isn't leaked
-- [ ] Transcript metadata tagging (narrative vs. list-style content)
 
 **Stretch goals**
 - [ ] Next.js frontend over a FastAPI wrapper (portfolio polish)
@@ -151,10 +145,10 @@ Evaluation is treated as a **first-class signal**, not an afterthought.
 
 ## 📌 Notes
 
-This is a final-year project built for the IronHack bootcamp curriculum. The pipeline is currently prototyped against a Dark Souls 1 challenge-run video corpus as a test domain — the architecture itself is domain-agnostic.
+This is a final-year project built for the IronHack bootcamp curriculum. The pipeline is currently prototyped against a Dark Souls 1 challenge-run video corpus as a test domain, the architecture itself is domain-agnostic.
 
 ---
 
 ## 📄 License
 
-MIT *(or your choice — update this section)*.
+MIT *(or your choice, update this section)*.
