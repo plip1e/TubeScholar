@@ -10,6 +10,7 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from urllib.parse import urlparse, parse_qs
 from langchain_core.tools import tool
 from googleapiclient import discovery
+from googleapiclient.errors import HttpError
 from langchain_chroma import Chroma
 import chromadb, whisper, yt_dlp
 
@@ -27,6 +28,44 @@ load_dotenv()
 UTUBE_API = os.getenv("YOUTUBE_API_KEY")
 WS_USERNAME = os.getenv("WEBSHARE_PROXY_USERNAME")
 WS_PASSWORD = os.getenv("WEBSHARE_PROXY_PASSWORD")
+
+
+def _youtube_error(e: HttpError) -> dict:
+    """Turn a googleapiclient HttpError into a flat, agent-readable dict.
+
+    Pulls the HTTP status and the API's own reason/message out of the error so a
+    tool can return something the supervisor can act on (e.g. quota exceeded vs.
+    the API/key being blocked) instead of crashing the run.
+    """
+    status = getattr(getattr(e, "resp", None), "status", None)
+    reason = ""
+    message = str(e)
+    try:
+        details = (e.error_details or [{}])[0] if hasattr(e, "error_details") else {}
+        reason = details.get("reason", "")
+        message = details.get("message", message)
+    except Exception:
+        pass
+
+    if status == 403 and ("blocked" in message.lower() or reason == "forbidden"):
+        action = ("The YouTube Data API request was blocked. Check that the API key is valid, "
+                  "that the YouTube Data API v3 is enabled for its project, and that any API/IP/"
+                  "referrer restrictions on the key allow this call. Do not retry until the key is fixed.")
+    elif status == 403 and reason in ("quotaExceeded", "rateLimitExceeded"):
+        action = "The YouTube Data API quota/rate limit was hit. Wait and retry later, or ask the user for a fresh quota."
+    elif status == 400:
+        action = "The YouTube Data API rejected the request as malformed. Check the query/parameters."
+    else:
+        action = "The YouTube Data API call failed. Do not retry the identical request immediately."
+
+    return {
+        "status": "youtube_api_error",
+        "http_status": status,
+        "reason": reason or "unknown",
+        "message": message,
+        "action": action,
+    }
+
 
 class VideoIngestionPipeline:
     def __init__(self, google_api_key: str):
@@ -62,22 +101,33 @@ class VideoIngestionPipeline:
     # -- private helpers ------------------------------------------------------------
 
     def _get_video_id(self, url: str) -> str:
+        if not url or not isinstance(url, str):
+            raise ValueError("No URL provided.")
         if "youtu.be" in url:
-            return url.split("/")[-1].split("?")[0]
-        if "/shorts/" in url:
-            return url.split("/shorts/")[-1].split("?")[0]
-        return parse_qs(urlparse(url).query)["v"][0]
+            vid = url.split("/")[-1].split("?")[0]
+        elif "/shorts/" in url:
+            vid = url.split("/shorts/")[-1].split("?")[0]
+        else:
+            vid = (parse_qs(urlparse(url).query).get("v") or [None])[0]
+        if not vid:
+            raise ValueError(f"Could not extract a video id from URL: {url!r}")
+        return vid
 
     def _get_channel_description(self, channel_id: str) -> str:
         """Channel ('creator') description, cached by channel_id."""
         if channel_id in self._channel_desc_cache:
             return self._channel_desc_cache[channel_id]
-        response = self.youtube.channels().list(
-            part="snippet",
-            id=channel_id
-        ).execute()
-        items = response.get("items") or []
-        description = items[0]["snippet"]["description"] if items else ""
+        try:
+            response = self.youtube.channels().list(
+                part="snippet",
+                id=channel_id
+            ).execute()
+            items = response.get("items") or []
+            description = items[0]["snippet"]["description"] if items else ""
+        except (HttpError, KeyError, IndexError) as e:
+            # description is optional metadata; never let it sink an ingestion
+            print(f"[channel] could not fetch description for {channel_id}: {type(e).__name__}: {e}")
+            description = ""
         self._channel_desc_cache[channel_id] = description
         return description
 
@@ -86,19 +136,26 @@ class VideoIngestionPipeline:
             part="snippet,statistics,contentDetails",
             id=video_id
         ).execute()
-        item = response["items"][0]
-        snippet, stats = item["snippet"], item["statistics"]
+        items = response.get("items") or []
+        if not items:
+            # empty when the id is invalid, or the video is private/deleted/region-blocked
+            return None
+        item = items[0]
+        snippet = item.get("snippet", {})
+        stats = item.get("statistics", {})
+        content_details = item.get("contentDetails", {})
+        channel_id = snippet.get("channelId")
         return {
             "video_id":    video_id,
             "url":         f"https://www.youtube.com/watch?v={video_id}",
-            "title":       snippet["title"],
-            "channel":     snippet["channelTitle"],
-            "channel_id":  snippet["channelId"],
-            "channel_description": self._get_channel_description(snippet["channelId"]),
-            "published_at": snippet["publishedAt"],
+            "title":       snippet.get("title"),
+            "channel":     snippet.get("channelTitle"),
+            "channel_id":  channel_id,
+            "channel_description": self._get_channel_description(channel_id) if channel_id else "",
+            "published_at": snippet.get("publishedAt"),
             "view_count":  stats.get("viewCount"),
             "like_count":  stats.get("likeCount"),
-            "duration":    item["contentDetails"]["duration"],
+            "duration":    content_details.get("duration"),
         }
 
     def _get_transcript(self, video_id: str) -> dict:
@@ -115,10 +172,18 @@ class VideoIngestionPipeline:
             # downloading the audio and transcribing it locally with Whisper, which
             # never touches the rate-limited timedtext endpoint.
             print(f"[transcript] captions unavailable for {video_id} ({type(e).__name__}); falling back to Whisper")
-            return {
-                "transcript": self._whisper_transcribe(video_id),
-                "transcript_source": "whisper"
-            }
+            try:
+                return {
+                    "transcript": self._whisper_transcribe(video_id),
+                    "transcript_source": "whisper"
+                }
+            except Exception as we:
+                # Whisper fallback failed too (download blocked, no audio, ffmpeg
+                # missing, etc.). Surface it to the caller rather than crashing.
+                raise RuntimeError(
+                    f"Could not obtain a transcript for {video_id}: captions unavailable "
+                    f"({type(e).__name__}) and Whisper fallback failed ({type(we).__name__}: {we})."
+                ) from we
 
     def _whisper_transcribe(self, video_id: str) -> str:
         url = f"https://www.youtube.com/watch?v={video_id}"
@@ -128,11 +193,19 @@ class VideoIngestionPipeline:
             "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3"}],
             "quiet": True
         }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        result = self.whisper_model.transcribe(f"{video_id}.mp3")
-        os.remove(f"{video_id}.mp3")
-        return result["text"]
+        audio_path = f"{video_id}.mp3"
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+            result = self.whisper_model.transcribe(audio_path)
+            return result["text"]
+        finally:
+            # always clean up the temp audio, even if transcription raised
+            if os.path.exists(audio_path):
+                try:
+                    os.remove(audio_path)
+                except OSError as e:
+                    print(f"[whisper] could not remove temp file {audio_path}: {e}")
 
     def _chunk_transcript(self, transcript: str, chunk_size=500, overlap=50) -> list[str]:
         words = transcript.split()
@@ -189,8 +262,14 @@ class VideoIngestionPipeline:
         self.videos = {}
         self._placement_by_id = {}
 
-        stored = self.vectorstore.get()
-        metadatas = stored.get("metadatas") or []
+        try:
+            stored = self.vectorstore.get()
+            metadatas = stored.get("metadatas") or []
+        except Exception as e:
+            # a corrupt/unreadable store shouldn't prevent the pipeline from
+            # starting — begin with an empty registry instead.
+            print(f"[registry] could not load persisted store: {type(e).__name__}: {e}")
+            return
 
         # collapse chunk metadata down to one entry per video
         per_video: dict[str, dict] = {}
@@ -205,39 +284,89 @@ class VideoIngestionPipeline:
     # -- public interface (what agents call) ----------------------------------------
 
     def ingest_video(self, url: str) -> dict:
-        """Full pipeline: fetch metadata + transcript, chunk, embed, store."""
-        video_id = self._get_video_id(url)
+        """Full pipeline: fetch metadata + transcript, chunk, embed, store.
 
-        if not self._is_stale(video_id):
-            return {"status": "skipped", "reason": "already up to date", "video_id": video_id}
+        Returns a status dict in every case — including failures — so the
+        supervisor can react instead of the run crashing.
+        """
+        try:
+            video_id = self._get_video_id(url)
+        except ValueError as e:
+            return {
+                "status": "invalid_url",
+                "url": url,
+                "reason": str(e),
+                "action": "Ask the user for a valid, public YouTube URL (watch, youtu.be, or /shorts/).",
+            }
 
-        metadata = self._get_metadata(video_id)
-        transcript_data = self._get_transcript(video_id)
+        try:
+            if not self._is_stale(video_id):
+                return {"status": "skipped", "reason": "already up to date", "video_id": video_id}
 
-        full_record = {
-            **metadata,
-            **transcript_data,
-            "fetched_at": datetime.now().isoformat()
-        }
+            try:
+                metadata = self._get_metadata(video_id)
+            except HttpError as e:
+                return {**_youtube_error(e), "video_id": video_id}
 
-        chunks = self._chunk_transcript(full_record["transcript"])
-        chunk_metadatas = [{k: v for k, v in full_record.items() if k != "transcript"}
-                           for _ in chunks]
+            if metadata is None:
+                return {
+                    "status": "not_found",
+                    "video_id": video_id,
+                    "reason": "No video could be retrieved for this URL. The video is likely invalid, private, deleted, or region-blocked.",
+                    "action": "Do not retry the same URL. If the user named a specific video or channel, search for the closest matching video and confirm it with them before ingesting. Otherwise, ask the user to provide a valid, public YouTube URL.",
+                }
 
-        # remove any prior chunks for this video so re-ingestion can't duplicate,
-        # then add with deterministic IDs so the same chunk always upserts in place
-        self.vectorstore.delete(where={"video_id": video_id})
-        ids = [f"{video_id}-{i}" for i in range(len(chunks))]
-        self.vectorstore.add_texts(texts=chunks, metadatas=chunk_metadatas, ids=ids)
+            try:
+                transcript_data = self._get_transcript(video_id)
+            except RuntimeError as e:
+                return {
+                    "status": "transcript_unavailable",
+                    "video_id": video_id,
+                    "reason": str(e),
+                    "action": "Do not retry immediately. Tell the user this video has no usable transcript/audio.",
+                }
 
-        entry = self._register_video(full_record)
+            full_record = {
+                **metadata,
+                **transcript_data,
+                "fetched_at": datetime.now().isoformat()
+            }
 
-        return {
-            "status": "ingested",
-            "video_id": video_id,
-            "chunks": len(chunks),
-            "lst_placement": entry.lst_placement,
-        }
+            chunks = self._chunk_transcript(full_record["transcript"] or "")
+            if not chunks:
+                return {
+                    "status": "empty_transcript",
+                    "video_id": video_id,
+                    "reason": "The transcript was empty after processing.",
+                    "action": "Tell the user there was no spoken content to index for this video.",
+                }
+            chunk_metadatas = [{k: v for k, v in full_record.items() if k != "transcript"}
+                               for _ in chunks]
+
+            # remove any prior chunks for this video so re-ingestion can't duplicate,
+            # then add with deterministic IDs so the same chunk always upserts in place
+            self.vectorstore.delete(where={"video_id": video_id})
+            ids = [f"{video_id}-{i}" for i in range(len(chunks))]
+            self.vectorstore.add_texts(texts=chunks, metadatas=chunk_metadatas, ids=ids)
+
+            entry = self._register_video(full_record)
+
+            return {
+                "status": "ingested",
+                "video_id": video_id,
+                "chunks": len(chunks),
+                "lst_placement": entry.lst_placement,
+            }
+        except Exception as e:
+            # embedding/vector-store failures (e.g. Gemini embeddings API down or
+            # quota'd, Chroma write error) land here — report instead of crashing.
+            print(f"[ingest] failed for {video_id}: {type(e).__name__}: {e}")
+            return {
+                "status": "error",
+                "video_id": video_id,
+                "reason": f"{type(e).__name__}: {e}",
+                "action": "An unexpected error occurred while ingesting. Do not retry the same URL repeatedly; tell the user ingestion failed.",
+            }
 
     def get_video_info(self, placement: int = None, video_id: str = None) -> dict:
         """Quick metadata lookup for an agent tool — no vector search.
@@ -258,13 +387,115 @@ class VideoIngestionPipeline:
         """All ingested videos as flat metadata dicts, ordered by placement."""
         return [self.videos[p].as_dict() for p in sorted(self.videos)]
 
+    def search_transcripts(self, query: str, video_id: str = None, k: int = 5) -> list[dict]:
+        """Semantic search over ingested transcripts — the supervisor's context source.
+
+        Returns the top-k matching chunks (optionally scoped to one video) as
+        dicts of {text, video_id, title, creator, url, placement}, so an agent
+        gets both the passage and where it came from for citation/grading.
+        """
+        try:
+            retriever = self.get_retriever(video_id=video_id, k=k)
+            docs = retriever.invoke(query)
+        except Exception as e:
+            # embeddings/vector-store query failure — return an empty result set
+            # with a note rather than crashing the supervisor's turn.
+            print(f"[search_transcripts] query failed: {type(e).__name__}: {e}")
+            return []
+        results = []
+        for doc in docs:
+            meta = doc.metadata or {}
+            vid = meta.get("video_id")
+            results.append({
+                "text": doc.page_content,
+                "video_id": vid,
+                "title": meta.get("title"),
+                "creator": meta.get("channel"),
+                "url": meta.get("url", f"https://www.youtube.com/watch?v={vid}" if vid else None),
+                "placement": self._placement_by_id.get(vid),
+            })
+        return results
+
+    def search_youtube(self, query: str, channel: str = None, max_results: int = 5) -> list[dict]:
+        """Search YouTube itself for videos matching a free-text query.
+
+        Use this to find a video that hasn't been ingested yet — it hits the
+        YouTube Data API's search endpoint, not the local store. Optionally bias
+        toward a creator by passing `channel` (appended to the query). Returns
+        candidate {title, creator, video_id, url, published_at} dicts the agent
+        can confirm with the user before calling ingest_video.
+        """
+        q = f"{query} {channel}" if channel else query
+        try:
+            response = self.youtube.search().list(
+                part="snippet",
+                q=q,
+                type="video",
+                maxResults=max_results,
+            ).execute()
+        except HttpError as e:
+            # e.g. the 403 "Requests to this API ... are blocked" when the key is
+            # restricted or the YouTube Data API isn't enabled. Return a structured
+            # error the supervisor can read instead of crashing the run.
+            return [_youtube_error(e)]
+        results = []
+        for item in response.get("items") or []:
+            video_id = (item.get("id") or {}).get("videoId")
+            if not video_id:
+                continue  # channel/playlist results have no videoId
+            snippet = item.get("snippet", {})
+            results.append({
+                "video_id": video_id,
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+                "title": snippet.get("title"),
+                "creator": snippet.get("channelTitle"),
+                "published_at": snippet.get("publishedAt"),
+            })
+        return results
+
     def get_tools(self) -> list:
-        """LangChain tools bound to this pipeline — what an agent gets handed.
+        """LangChain tools bound to this pipeline — the full toolset the supervisor gets.
 
         Each tool is a closure over `self`, so its schema shows only the real
-        arguments (placement / video_id), not `self`. Start with these two;
-        append more here as they're tested.
+        arguments, not `self`. Covers the whole pipeline surface the supervisor
+        needs: ingest new videos, retrieve context to answer from, find videos on
+        YouTube that aren't ingested yet, look up/list metadata, and remove videos.
+        Append more here as they're tested.
         """
+        @tool
+        def ingest_video(url: str) -> dict:
+            """Ingest a YouTube video so it can be searched and answered about.
+
+            Fetches metadata + transcript, chunks, embeds, and stores it. Pass a
+            full YouTube URL (watch, youtu.be, or /shorts/). Returns a status dict
+            with the video_id, chunk count, and list placement; re-ingesting an
+            up-to-date video is skipped automatically.
+            """
+            return self.ingest_video(url)
+
+        @tool
+        def search_transcripts(query: str, video_id: str = None, k: int = 5) -> list[dict]:
+            """Semantic search over ingested video transcripts — use this to get
+            context before answering a content question.
+
+            Returns the top-k matching transcript chunks, each with its text and
+            source (video_id, title, creator, url, placement). Pass a video_id to
+            scope the search to a single video, or omit it to search all videos.
+            """
+            return self.search_transcripts(query=query, video_id=video_id, k=k)
+
+        @tool
+        def search_youtube(query: str, channel: str = None, max_results: int = 5) -> list[dict]:
+            """Search YouTube for videos that haven't been ingested yet.
+
+            Use this when the user names a video/topic with no URL and
+            search_transcripts finds nothing locally. Hits YouTube directly and
+            returns candidate {title, creator, video_id, url, published_at} dicts.
+            Optionally pass `channel` to bias toward a creator. Confirm the right
+            match with the user, then pass its url to ingest_video.
+            """
+            return self.search_youtube(query=query, channel=channel, max_results=max_results)
+
         @tool
         def get_video_info(placement: int = None, video_id: str = None) -> dict:
             """Look up an ingested video's metadata — no vector search.
@@ -280,7 +511,15 @@ class VideoIngestionPipeline:
             """List every ingested video as a flat metadata dict, ordered by placement."""
             return self.list_videos()
 
-        return [get_video_info, list_videos]
+        @tool
+        def delete_video(video_id: str) -> dict:
+            """Remove an ingested video and all its chunks from the store by video_id.
+
+            Surviving videos keep their list placement. Returns a status dict.
+            """
+            return self.delete_video(video_id)
+
+        return [ingest_video, search_transcripts, search_youtube, get_video_info, list_videos, delete_video]
 
     def get_retriever(self, video_id: str = None, k: int = 5):
         """Returns a retriever, optionally scoped to a single video."""
@@ -291,12 +530,35 @@ class VideoIngestionPipeline:
 
     def delete_video(self, video_id: str):
         """Remove all chunks for a video. useful for the management agent."""
-        self.vectorstore.delete(where={"video_id": video_id})
+        if not video_id:
+            return {"status": "error", "reason": "No video_id provided."}
+        try:
+            self.vectorstore.delete(where={"video_id": video_id})
+        except Exception as e:
+            print(f"[delete] failed for {video_id}: {type(e).__name__}: {e}")
+            return {"status": "error", "video_id": video_id, "reason": f"{type(e).__name__}: {e}"}
         # drop it from the registry too; surviving videos keep their placement
         placement = self._placement_by_id.pop(video_id, None)
         if placement is not None:
             self.videos.pop(placement, None)
         return {"status": "deleted", "video_id": video_id}
+
+    def clear_all(self) -> dict:
+        """Wipe every ingested video — drops all vectors and resets the registry.
+
+        Useful for a clean test run. `reset_collection` deletes and recreates the
+        underlying Chroma collection, so placements start from 1 again afterwards.
+        """
+        video_count = len(self.videos)
+        try:
+            self.vectorstore.reset_collection()
+        except Exception as e:
+            print(f"[clear_all] failed: {type(e).__name__}: {e}")
+            return {"status": "error", "reason": f"{type(e).__name__}: {e}"}
+        self.videos = {}
+        self._placement_by_id = {}
+        self._channel_desc_cache = {}
+        return {"status": "cleared", "videos_removed": video_count}
     
 
 
