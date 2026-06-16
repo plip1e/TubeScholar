@@ -1,0 +1,10 @@
+/app/data/*
+YT project/
+.venv/
+# Ignore all files in the static directory for now
+app/static/*
+
+.env
+qu.txt
+
+__pycache__/
