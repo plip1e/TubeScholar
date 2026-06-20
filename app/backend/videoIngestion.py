@@ -12,9 +12,7 @@ from langchain_core.tools import tool
 from googleapiclient import discovery
 from googleapiclient.errors import HttpError
 from langchain_chroma import Chroma
-import chromadb, whisper, yt_dlp
-
-from langsmith.wrappers import wrap_gemini
+import chromadb, yt_dlp
 
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api.proxies import WebshareProxyConfig
@@ -23,11 +21,22 @@ from func import VideoList
 
 
 load_dotenv()
-# FREE_API = os.getenv("FREE_GEMINI_API")
-# PAID_API = os.getenv("PAID_GEMINI_API")
-UTUBE_API = os.getenv("YOUTUBE_API_KEY")
+google_api_key = os.getenv("PAID_GEMINI_API") # FREE_GEMINI_API
+youtube_api_key = os.getenv("YOUTUBE_API_KEY")
 WS_USERNAME = os.getenv("WEBSHARE_PROXY_USERNAME")
 WS_PASSWORD = os.getenv("WEBSHARE_PROXY_PASSWORD")
+# Local Whisper speech-to-text is gated off by default while audio transcription
+# is being offloaded to an external Colab + FastAPI service (avoids loading the
+# model into memory on every startup). Set WHISPER_ENABLED=1 to re-enable it.
+WHISPER_ENABLED = os.getenv("WHISPER_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+class TranscriptUnavailable(Exception):
+    """No transcript could be produced (no captions, and Whisper is unavailable).
+
+    Carried up to ingest_video so it can return an agent-readable status with the
+    metadata the agent should fall back on, instead of crashing the run.
+    """
 
 
 def _youtube_error(e: HttpError) -> dict:
@@ -55,6 +64,10 @@ def _youtube_error(e: HttpError) -> dict:
         action = "The YouTube Data API quota/rate limit was hit. Wait and retry later, or ask the user for a fresh quota."
     elif status == 400:
         action = "The YouTube Data API rejected the request as malformed. Check the query/parameters."
+    elif status == 404:
+        action = ("The YouTube Data API returned 404 (not found). The requested resource/endpoint "
+                  "could not be located — check the method and that the YouTube Data API v3 is enabled "
+                  "for the key's project. Do not retry the identical request.")
     else:
         action = "The YouTube Data API call failed. Do not retry the identical request immediately."
 
@@ -68,33 +81,32 @@ def _youtube_error(e: HttpError) -> dict:
 
 
 class VideoIngestionPipeline:
-    def __init__(self, google_api_key: str):
+    def __init__(self, google_api_key: str, youtube_api_key: str):
         self.max_age_days = 7
-        self.youtube = wrap_gemini(discovery.build("youtube", "v3", developerKey=google_api_key))
+        self.youtube = discovery.build("youtube", "v3", developerKey=youtube_api_key)
         self.ytt_api = YouTubeTranscriptApi(proxy_config=WebshareProxyConfig(
                                             proxy_username=WS_USERNAME,
                                             proxy_password=WS_PASSWORD,
                                             ))
-        self.whisper_model = whisper.load_model("base")
-        self.embeddings = wrap_gemini(GoogleGenerativeAIEmbeddings(
+        # Disabled by default (see WHISPER_ENABLED)
+        self.whisper_model = None
+        if WHISPER_ENABLED:
+            import whisper
+            self.whisper_model = whisper.load_model("base")
+        self.embeddings = GoogleGenerativeAIEmbeddings(
             model="models/gemini-embedding-001",
             google_api_key=google_api_key
-        ))
+        )
         self.vectorstore = Chroma(
             collection_name="youtube_videos",
             embedding_function=self.embeddings,
-            # anchored to app/data so the same DB is used no matter
-            # which working directory the app is launched from
+            # anchored to app/data so the same DB is used
             persist_directory=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "chroma_db")
         )
 
-        # quick-access metadata registry (what agent tools read instead of
-        # searching the vector store): placement -> VideoList, plus a
-        # video_id -> placement index so re-ingestion keeps a stable slot.
+        # quick-access metadata registry
         self.videos: dict[int, VideoList] = {}
         self._placement_by_id: dict[str, int] = {}
-        # channel descriptions are reused across a creator's videos; cache them
-        # so we don't pay an extra YouTube call per video for the same channel.
         self._channel_desc_cache: dict[str, str] = {}
         self._rebuild_registry()
 
@@ -149,6 +161,7 @@ class VideoIngestionPipeline:
             "video_id":    video_id,
             "url":         f"https://www.youtube.com/watch?v={video_id}",
             "title":       snippet.get("title"),
+            "description": snippet.get("description"),
             "channel":     snippet.get("channelTitle"),
             "channel_id":  channel_id,
             "channel_description": self._get_channel_description(channel_id) if channel_id else "",
@@ -158,6 +171,37 @@ class VideoIngestionPipeline:
             "duration":    content_details.get("duration"),
         }
 
+    def _get_top_comments(self, video_id: str, max_comments: int = 15) -> list[dict]:
+        """Top-level comments by relevance — fallback overview material.
+
+        Used when a video has no usable transcript so the agent has the audience's
+        own words to infer what the video is about. Returns [] (never raises) if
+        comments are disabled, missing, or the call fails — it's optional context.
+        """
+        try:
+            response = self.youtube.commentThreads().list(
+                part="snippet",
+                videoId=video_id,
+                order="relevance",
+                maxResults=max_comments,
+                textFormat="plainText",
+            ).execute()
+        except HttpError as e:
+            status = getattr(getattr(e, "resp", None), "status", None)
+            print(f"[comments] could not fetch comments for {video_id} (HTTP {status}); likely disabled")
+            return []
+        comments = []
+        for item in response.get("items") or []:
+            top = (((item.get("snippet") or {}).get("topLevelComment") or {}).get("snippet") or {})
+            text = top.get("textDisplay")
+            if text:
+                comments.append({
+                    "author": top.get("authorDisplayName"),
+                    "text": text,
+                    "like_count": top.get("likeCount"),
+                })
+        return comments
+
     def _get_transcript(self, video_id: str) -> dict:
         try:
             fetched = self.ytt_api.fetch(video_id)
@@ -166,11 +210,13 @@ class VideoIngestionPipeline:
                 "transcript_source": "captions"
             }
         except (TranscriptsDisabled, NoTranscriptFound, CouldNotRetrieveTranscript, RequestException) as e:
-            # No captions, captions disabled, or the request was blocked/rate-limited.
-            # RequestException covers RetryError ("too many 429 error responses") raised
-            # when the timedtext endpoint rate-limits the proxy IP. Fall back to
-            # downloading the audio and transcribing it locally with Whisper, which
-            # never touches the rate-limited timedtext endpoint.
+            if not (WHISPER_ENABLED and self.whisper_model is not None):
+                # Whisper fallback is currently disabled
+                raise TranscriptUnavailable(
+                    f"No captions/transcript for {video_id} ({type(e).__name__}) and Whisper "
+                    f"speech-to-text is currently unavailable."
+                ) from e
+            # Whisper enabled: download the audio and transcribe it locally
             print(f"[transcript] captions unavailable for {video_id} ({type(e).__name__}); falling back to Whisper")
             try:
                 return {
@@ -180,7 +226,7 @@ class VideoIngestionPipeline:
             except Exception as we:
                 # Whisper fallback failed too (download blocked, no audio, ffmpeg
                 # missing, etc.). Surface it to the caller rather than crashing.
-                raise RuntimeError(
+                raise TranscriptUnavailable(
                     f"Could not obtain a transcript for {video_id}: captions unavailable "
                     f"({type(e).__name__}) and Whisper fallback failed ({type(we).__name__}: {we})."
                 ) from we
@@ -318,12 +364,33 @@ class VideoIngestionPipeline:
 
             try:
                 transcript_data = self._get_transcript(video_id)
-            except RuntimeError as e:
+            except TranscriptUnavailable as e:
                 return {
                     "status": "transcript_unavailable",
                     "video_id": video_id,
                     "reason": str(e),
-                    "action": "Do not retry immediately. Tell the user this video has no usable transcript/audio.",
+                    "transcript_available": False,
+                    "whisper_status": "unavailable",
+                    "metadata_overview": {
+                        "title": metadata.get("title"),
+                        "channel": metadata.get("channel"),
+                        "description": metadata.get("description"),
+                        "channel_description": metadata.get("channel_description"),
+                        "published_at": metadata.get("published_at"),
+                        "view_count": metadata.get("view_count"),
+                        "like_count": metadata.get("like_count"),
+                        "duration": metadata.get("duration"),
+                        "top_comments": self._get_top_comments(video_id),
+                    },
+                    "action": (
+                        "This video could not be ingested: it has no captions/transcript and "
+                        "automatic speech-to-text (Whisper) is currently unavailable. Do NOT retry "
+                        "ingestion. Be transparent with the user that there is no transcript or "
+                        "captions for this video. Then use the fields in metadata_overview (title, "
+                        "description, channel_description, and top_comments) to write a brief overview "
+                        "of what the video is likely about. Make clear this is inferred from the "
+                        "video's metadata and audience comments, not from its actual spoken content."
+                    ),
                 }
 
             full_record = {
@@ -358,8 +425,6 @@ class VideoIngestionPipeline:
                 "lst_placement": entry.lst_placement,
             }
         except Exception as e:
-            # embedding/vector-store failures (e.g. Gemini embeddings API down or
-            # quota'd, Chroma write error) land here — report instead of crashing.
             print(f"[ingest] failed for {video_id}: {type(e).__name__}: {e}")
             return {
                 "status": "error",
@@ -398,8 +463,6 @@ class VideoIngestionPipeline:
             retriever = self.get_retriever(video_id=video_id, k=k)
             docs = retriever.invoke(query)
         except Exception as e:
-            # embeddings/vector-store query failure — return an empty result set
-            # with a note rather than crashing the supervisor's turn.
             print(f"[search_transcripts] query failed: {type(e).__name__}: {e}")
             return []
         results = []
@@ -434,9 +497,6 @@ class VideoIngestionPipeline:
                 maxResults=max_results,
             ).execute()
         except HttpError as e:
-            # e.g. the 403 "Requests to this API ... are blocked" when the key is
-            # restricted or the YouTube Data API isn't enabled. Return a structured
-            # error the supervisor can read instead of crashing the run.
             return [_youtube_error(e)]
         results = []
         for item in response.get("items") or []:

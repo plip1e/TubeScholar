@@ -5,9 +5,10 @@ from dotenv import load_dotenv
 # import pandas as pd
 import os, uuid
 
-from langchain.messages import HumanMessage, ToolMessage, SystemMessage, AIMessage
+from langchain.messages import HumanMessage, ToolMessage, SystemMessage, AIMessage, AIMessageChunk
 from langchain_classic.retrievers.multi_query import MultiQueryRetriever
 from langgraph.checkpoint.memory import InMemorySaver
+from langchain_core.runnables import RunnableConfig
 from langgraph_supervisor import create_supervisor
 from langgraph.graph import StateGraph, START, END
 from langchain.chat_models import init_chat_model
@@ -16,13 +17,15 @@ from videoIngestion import VideoIngestionPipeline
 from func import State, IntentClassifier
 from sub_agents import verification_agent
 
+import chainlit as cl
+
 load_dotenv()
 UTUBE_API = os.getenv("YOUTUBE_API_KEY")
 GEMINI_API = os.getenv("PAID_GEMINI_API") # PAID_GEMINI_API / FREE_GEMINI_API
 
 temp = .7
 llm = init_chat_model(model="google_genai:gemini-3.1-flash-lite", api_key=GEMINI_API, temperature=temp)
-pipeline = VideoIngestionPipeline(google_api_key=UTUBE_API)
+pipeline = VideoIngestionPipeline(google_api_key=GEMINI_API, youtube_api_key=UTUBE_API)
 tools = pipeline.get_tools()
 tooled_llm = llm.bind_tools(tools)
 checkpointer = InMemorySaver()
@@ -119,39 +122,86 @@ Output:
 
 # TODO create enviroment identifier ['single_video', 'topic_search', 'personal_collection']
 
-if __name__ == '__main__':
+# --- Main --------------------------------------------------------------------------------
 
-    pipeline_tools = pipeline.get_tools()
+pipeline_tools = pipeline.get_tools()
 
-    supervisor = create_supervisor(
-        agents=[verification_agent],
-        tools=pipeline_tools,
-        model=init_chat_model(model="google_genai:gemini-3.1-flash-lite", api_key=GEMINI_API, temperature=temp),
-        prompt=supervisor_system_message,
-        output_mode='full_history'
-    ).compile()
+supervisor = create_supervisor(
+    agents=[verification_agent],
+    tools=pipeline_tools,
+    model=init_chat_model(model="google_genai:gemini-3.1-flash-lite", api_key=GEMINI_API, temperature=temp),
+    prompt=supervisor_system_message,
+    output_mode='full_history'
+).compile()
 
-    # --- graph: classify -> route -> (chitchat | supervisor) -> END --------
-    builder = StateGraph(State)
-    builder.add_node("classify", classify_intent)
-    builder.add_node("chitchat", chitchat_responder)
-    builder.add_node("supervisor", supervisor)
+# --- graph: classify -> route -> (chitchat | supervisor) -> END --------
+builder = StateGraph(State)
+builder.add_node("classify", classify_intent)
+builder.add_node("chitchat", chitchat_responder)
+builder.add_node("supervisor", supervisor)
 
-    builder.add_edge(START, "classify")
-    builder.add_conditional_edges("classify", route_after_classify, {
-        "chitchat": "chitchat",
-        "supervisor": "supervisor",
-    })
-    builder.add_edge("chitchat", END)
-    builder.add_edge("supervisor", END)
+builder.add_edge(START, "classify")
+builder.add_conditional_edges("classify", route_after_classify, {
+    "chitchat": "chitchat",
+    "supervisor": "supervisor",
+})
+builder.add_edge("chitchat", END)
+builder.add_edge("supervisor", END)
 
-    graph = builder.compile(checkpointer=checkpointer)
+graph = builder.compile(checkpointer=checkpointer)
 
-    config = {
-        "configurable": {
-            "thread_id": str(uuid.uuid4()),
-        }
+config = {
+    "configurable": {
+        "thread_id": str(uuid.uuid4()),
     }
+}
+
+# Nodes whose LLM output is meant for the user:
+#   - "chitchat": the direct social-reply node in this graph.
+#   - "agent":    the react-agent node *inside* the supervisor subgraph that
+#                 produces the supervisor's final answer.
+# The "classify" node streams raw structured-output JSON, and the
+# verification_agent also runs under an "agent" node — both are internal and
+# filtered out (the latter by namespace, see is_internal_namespace).
+ANSWER_NODES = {"chitchat", "agent"}
+
+
+def is_internal_namespace(namespace) -> bool:
+    '''With subgraphs=True the stream tags each token with the subgraph path it
+    came from. Tokens from the verification_agent are internal proof-reading,
+    not part of the answer shown to the user.'''
+    return any("verification_agent" in part for part in namespace)
+
+
+@cl.on_message
+async def on_message(message: cl.Message):
+    config = {"configurable": {"thread_id": cl.context.session.id}}
+    cb = cl.LangchainCallbackHandler()
+    final_answer = cl.Message(content="")
+
+    # subgraphs=True so the supervisor's tokens stream through (otherwise the
+    # subgraph emits one whole AIMessage that token-streaming filters miss).
+    # Each item is (namespace, (message_chunk, metadata)).
+    async for namespace, (chunk, metadata) in graph.astream(
+        {"messages": [HumanMessage(content=message.content)]},
+        stream_mode="messages",
+        subgraphs=True,
+        config=RunnableConfig(callbacks=[cb], **config),
+    ):
+        if (
+            isinstance(chunk, AIMessageChunk)
+            and metadata.get("langgraph_node") in ANSWER_NODES
+            and not is_internal_namespace(namespace)
+        ):
+            token = extract_text(chunk)  # Gemini content can be a list of blocks
+            if token:
+                await final_answer.stream_token(token)
+
+    await final_answer.send()
+
+
+
+if __name__ == '__main__':
 
     # Delete all saved data for a clean test
     if input("Wipe all ingested videos for a clean test? (y/n) ").lower() == "y":

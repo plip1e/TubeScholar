@@ -1,10 +1,14 @@
 /app/data/*
 YT project/
 .venv/
+.chainlit/
+.files/
 # Ignore all files in the static directory for now
 app/static/*
 
 .env
 qu.txt
+chainlit.md
+*.ipynb
 
 __pycache__/
