@@ -1,5 +1,6 @@
 import os, time
 import uuid
+import requests
 import pandas as pd
 from pathlib import Path
 from langchain.chat_models import init_chat_model
@@ -78,6 +79,7 @@ class VideoList:
         }
 
 # ---------------------------------------------------------------------------
+
 
 class RAGEvaluator:
     """
@@ -294,3 +296,263 @@ Answer: {answer}
         print(f"\nSaved → {save_path}")
 
         return df
+
+# --- wiki ------------------------------------------------------------------
+
+
+class WikiVerifier:
+    """Wikidata lookup helper for the verification agent.
+
+    Resolves a person's name to a Wikidata entity (QID) and pulls structured
+    facts — occupations, field of work, and education — that an answer can be
+    fact-checked against.
+
+    QIDs (e.g. "Q82955") are kept as the primary return value: they are a
+    language-independent, exact match key. The agent compares the QIDs found in
+    a person's claims against reference QIDs rather than fuzzy-matching strings.
+    `humanise_qid` is provided for when the LLM needs a readable label to put in
+    a prompt or answer.
+    """
+
+    WIKIDATA_API = "https://www.wikidata.org/w/api.php"
+    WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
+    HEADERS = {"User-Agent": "TubeScholar/0.1 (ak47dodger@gmail.com)"}
+
+    # human-friendly name -> Wikidata property id
+    PROPS = {
+        "occupations": "P106",
+        "field_of_work": "P101",
+        "major": "P812",
+        "degree": "P512",
+        "educated_at": "P69",
+    }
+
+    # ------------------------------------------------------------------
+    # internals (requests-only; ported from test.ipynb)
+    # ------------------------------------------------------------------
+
+    def _find_qid(self, name: str, lang: str = "en") -> list[dict]:
+        """Search Wikidata entities by name -> candidate {id, label, description}."""
+        r = requests.get(
+            self.WIKIDATA_API,
+            params={
+                "action": "wbsearchentities",
+                "search": name,
+                "language": lang,
+                "format": "json",
+                "limit": 5,
+            },
+            headers=self.HEADERS,
+            timeout=10,
+        )
+        r.raise_for_status()
+        return [
+            {
+                "id": res["id"],
+                "label": res.get("label"),
+                "description": res.get("description"),
+            }
+            for res in r.json()["search"]
+        ]
+
+    def _get_claims(self, qid: str) -> dict:
+        """Pull only the claims block for an entity."""
+        r = requests.get(
+            self.WIKIDATA_API,
+            params={
+                "action": "wbgetentities",
+                "ids": qid,
+                "props": "claims",
+                "format": "json",
+            },
+            headers=self.HEADERS,
+            timeout=10,
+        )
+        r.raise_for_status()
+        return r.json()["entities"][qid]["claims"]
+
+    def _extract_property_qids(self, claims: dict, prop: str) -> list[str]:
+        """All entity-valued QIDs for a property; missing property -> []."""
+        out = []
+        for stmt in claims.get(prop, []):
+            snak = stmt.get("mainsnak", {})
+            if snak.get("snaktype") != "value":  # skip novalue/somevalue
+                continue
+            qid = snak.get("datavalue", {}).get("value", {})
+            if isinstance(qid, dict) and qid.get("id"):
+                out.append(qid["id"])
+        return out
+
+    def _labels_for(self, qids: list[str], lang: str = "en") -> dict:
+        """Batch-resolve QIDs -> {qid: label}. Wikidata caps ids at 50/call."""
+        labels = {}
+        for i in range(0, len(qids), 50):
+            batch = qids[i:i + 50]
+            r = requests.get(
+                self.WIKIDATA_API,
+                params={
+                    "action": "wbgetentities",
+                    "ids": "|".join(batch),
+                    "props": "labels",
+                    "languages": lang,
+                    "format": "json",
+                },
+                headers=self.HEADERS,
+                timeout=10,
+            )
+            r.raise_for_status()
+            for qid, ent in r.json().get("entities", {}).items():
+                lbl = ent.get("labels", {}).get(lang, {}).get("value")
+                if lbl:
+                    labels[qid] = lbl
+        return labels
+
+    def _profile_from_claims(self, name: str, qid: str, claims: dict) -> dict:
+        return {
+            "name": name,
+            "qid": qid,
+            "url": f"https://www.wikidata.org/wiki/{qid}",
+            "occupations": self._extract_property_qids(claims, self.PROPS["occupations"]),
+            "field_of_work": self._extract_property_qids(claims, self.PROPS["field_of_work"]),
+            "education": {
+                "major": self._extract_property_qids(claims, self.PROPS["major"]),
+                "degree": self._extract_property_qids(claims, self.PROPS["degree"]),
+                "educated_at": self._extract_property_qids(claims, self.PROPS["educated_at"]),
+            },
+        }
+
+    # ------------------------------------------------------------------
+    # public
+    # ------------------------------------------------------------------
+
+    def get_profile(self, name: str) -> dict:
+        """Resolve a name to its best Wikidata match and return its profile."""
+        candidates = self._find_qid(name)
+        if not candidates:
+            return {"error": f"no Wikidata match for {name!r}"}
+        qid = candidates[0]["id"]
+        return self._profile_from_claims(name, qid, self._get_claims(qid))
+
+    def get_profile_by_qid(self, qid: str) -> dict:
+        """Return the profile for a known QID (skips name search)."""
+        return self._profile_from_claims(qid, qid, self._get_claims(qid))
+
+    def search_person(self, name: str) -> list[dict]:
+        """Return candidate matches (id, label, description) for disambiguation."""
+        return self._find_qid(name)
+
+    def get_property(self, qid: str, prop: str) -> list:
+        """Return all values for any Wikidata property of an entity.
+
+        Entity-valued statements come back as QIDs; literal statements (dates,
+        strings, quantities) come back as their raw datavalue.
+        """
+        claims = self._get_claims(qid)
+        out = []
+        for stmt in claims.get(prop, []):
+            snak = stmt.get("mainsnak", {})
+            if snak.get("snaktype") != "value":
+                continue
+            value = snak.get("datavalue", {}).get("value")
+            if isinstance(value, dict) and value.get("id"):
+                out.append(value["id"])  # entity reference
+            else:
+                out.append(value)  # literal (time/string/quantity/...)
+        return out
+
+    def humanise_qid(self, qid: str) -> str:
+        """Resolve a single QID to its English label (or the QID if unresolved)."""
+        return self._labels_for([qid]).get(qid, qid)
+
+    def wiki_search(self, query: str, results: int = 3) -> list[dict]:
+        """General Wikipedia lookup for any topic (not just people).
+
+        Returns the best-matching articles as {title, extract, url}, where
+        extract is the plain-text intro of the article.
+        """
+        r = requests.get(
+            self.WIKIPEDIA_API,
+            params={
+                "action": "query",
+                "format": "json",
+                "generator": "search",
+                "gsrsearch": query,
+                "gsrlimit": results,
+                "prop": "extracts|info",
+                "exintro": 1,
+                "explaintext": 1,
+                "inprop": "url",
+                "redirects": 1,
+            },
+            headers=self.HEADERS,
+            timeout=10,
+        )
+        r.raise_for_status()
+        pages = r.json().get("query", {}).get("pages", {})
+        ordered = sorted(pages.values(), key=lambda p: p.get("index", 0))
+        return [
+            {
+                "title": p.get("title"),
+                "extract": (p.get("extract") or "").strip(),
+                "url": p.get("fullurl"),
+            }
+            for p in ordered
+        ]
+
+    def get_tools(self) -> dict:
+
+        @tool
+        def get_profile(name: str) -> dict:
+            """Look up a person on Wikidata by name and return their profile:
+            occupations (P106), field_of_work (P101) and education (major/degree/
+            educated_at) as Wikidata QIDs, plus the entity QID and wiki URL.
+            QIDs are exact, language-independent match keys — compare them against
+            reference QIDs. Returns {"error": ...} if no match is found."""
+            return self.get_profile(name)
+
+        @tool
+        def get_profile_by_qid(qid: str) -> dict:
+            """Same profile as get_profile, but for a QID you already have
+            (e.g. one chosen via search_person). Skips the name search."""
+            return self.get_profile_by_qid(qid)
+
+        @tool
+        def search_person(name: str) -> list:
+            """Search Wikidata for people matching a name. Returns up to 5
+            candidates as {id, label, description} so you can disambiguate name
+            collisions before fetching a profile."""
+            return self.search_person(name)
+
+        @tool
+        def get_property(qid: str, prop: str) -> list:
+            """Fetch any Wikidata property of an entity by P-code (e.g. P569 date
+            of birth, P27 country of citizenship, P166 awards). Entity values are
+            returned as QIDs; literals (dates/strings/quantities) as raw values."""
+            return self.get_property(qid, prop)
+
+        @tool
+        def humanise_qid(qid: str) -> str:
+            """Convert a single Wikidata QID into its English label, for when you
+            need a human-readable term in your answer (e.g. Q82955 -> 'politician')."""
+            return self.humanise_qid(qid)
+
+        @tool
+        def wiki_search(query: str) -> list:
+            """General Wikipedia search for ANY topic (events, places, concepts,
+            organisations — not just people). Returns the top matching articles as
+            {title, extract, url}, where extract is the article's plain-text intro.
+            Use this to fact-check non-person claims."""
+            return self.wiki_search(query)
+
+        return {
+            "get_profile": get_profile,
+            "get_profile_by_qid": get_profile_by_qid,
+            "search_person": search_person,
+            "get_property": get_property,
+            "humanise_qid": humanise_qid,
+            "wiki_search": wiki_search,
+        }
+
+
+# ---------------------------------------------------------------------------
+

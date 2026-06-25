@@ -9,13 +9,13 @@ from langchain.messages import HumanMessage, ToolMessage, SystemMessage, AIMessa
 from langchain_classic.retrievers.multi_query import MultiQueryRetriever
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.runnables import RunnableConfig
-from langgraph_supervisor import create_supervisor
 from langgraph.graph import StateGraph, START, END
+from langgraph_supervisor import create_supervisor
 from langchain.chat_models import init_chat_model
 
 from videoIngestion import VideoIngestionPipeline
+from agents import verification_agent
 from func import State, IntentClassifier
-from sub_agents import verification_agent
 
 import chainlit as cl
 
@@ -30,6 +30,7 @@ tools = pipeline.get_tools()
 tooled_llm = llm.bind_tools(tools)
 checkpointer = InMemorySaver()
 max_rounds_of_revisions = 2
+min_vids_confidence = 3
 
 def classify_intent(state: State):
     '''
@@ -90,6 +91,10 @@ def extract_text(message) -> str:
 
 
 
+# TODO create enviroment identifier ['single_video', 'topic_search', 'personal_collection']
+
+# --- Main --------------------------------------------------------------------------------
+
 # --- Supervisor Agent ------------------------------------------------------
 
 supervisor_system_message = f"""
@@ -106,6 +111,17 @@ Routing:
   - If it flags misinformation, revise and re-verify (max {max_rounds_of_revisions} rounds), then stop.
 - Do not call an agent twice for the same input. If both checks pass, return the answer and stop delegating.
 
+Confidence & attribution:
+- Prefer at least {min_vids_confidence} distinct ingested videos backing a claim before stating it as an absolute,
+  general truth. Judge this from the `source` of your search results (count distinct video_ids)
+  or `list_videos`.
+- When fewer than {min_vids_confidence} distinct videos support a claim, do NOT state it as settled fact and do NOT
+  tell the user there aren't enough videos ingested. Instead, attribute and soften it — frame it
+  as a point of view rather than a verified conclusion, e.g.
+  "This is what <creator> says about this topic..." or "Based on <creator>'s take, ...".
+- The more independent videos agree, the more confidently you may state something. A single source
+  is always an attributed opinion, never a general fact.
+
 Guardrails:
 - Never invent facts. If you lack information, delegate or ask — don't guess.
 - One delegation at a time; use each agent's result before the next call.
@@ -114,15 +130,6 @@ Output:
 - Return the final answer, then one line: what you delegated and the outcome.
 - If blocked, ask only for the specific thing you need to proceed.
 """
-
-# ---------------------------------------------------------------------------
-
-
-
-
-# TODO create enviroment identifier ['single_video', 'topic_search', 'personal_collection']
-
-# --- Main --------------------------------------------------------------------------------
 
 pipeline_tools = pipeline.get_tools()
 
@@ -133,6 +140,8 @@ supervisor = create_supervisor(
     prompt=supervisor_system_message,
     output_mode='full_history'
 ).compile()
+
+# ---------------------------------------------------------------------------
 
 # --- graph: classify -> route -> (chitchat | supervisor) -> END --------
 builder = StateGraph(State)
@@ -202,34 +211,4 @@ async def on_message(message: cl.Message):
 
 
 if __name__ == '__main__':
-
-    # Delete all saved data for a clean test
-    if input("Wipe all ingested videos for a clean test? (y/n) ").lower() == "y":
-        result = pipeline.clear_all()
-        print(f"Cleared store — removed {result['videos_removed']} video(s).")
-
-    mes = [
-        "Can u get the video miniminuteman made about finding atlantis",
-    ]
-
-    if input("Run routing test? (y/n) ").lower() == "y":
-        for me in mes:
-            routed = classify_intent({"messages": [HumanMessage(me)]})
-            print(f"{me!r:60} -> {routed['message_intent']:13} -> {route_after_classify(routed)}")
-    else:
-        # --- example run ---
-        for me in mes:
-            while True:
-                try:
-                    state = State(messages=[HumanMessage(me)])
-                    final_state = graph.invoke(state, config)
-                    print(f"AI -> {extract_text(final_state['messages'][-1])}")
-                except KeyboardInterrupt:
-                    print("\nExiting.")
-                    break
-                except Exception as e:
-                    # keep the REPL alive on any per-turn failure (LLM/API error,
-                    # tool error, etc.) instead of dropping the whole session.
-                    print(f"AI -> [error] something went wrong this turn: {type(e).__name__}: {e}")
-                me = input("User -> ")
-
+    pass

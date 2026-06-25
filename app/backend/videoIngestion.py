@@ -1,6 +1,8 @@
 '''This module holds the agent that ingests videos using the given URL, vectorises them, and adds them to the Chromadb database'''
 
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 from datetime import datetime
 
@@ -9,6 +11,7 @@ from requests.exceptions import RequestException
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from urllib.parse import urlparse, parse_qs
 from langchain_core.tools import tool
+from langsmith import traceable
 from googleapiclient import discovery
 from googleapiclient.errors import HttpError
 from langchain_chroma import Chroma
@@ -83,11 +86,12 @@ def _youtube_error(e: HttpError) -> dict:
 class VideoIngestionPipeline:
     def __init__(self, google_api_key: str, youtube_api_key: str):
         self.max_age_days = 7
-        self.youtube = discovery.build("youtube", "v3", developerKey=youtube_api_key)
-        self.ytt_api = YouTubeTranscriptApi(proxy_config=WebshareProxyConfig(
-                                            proxy_username=WS_USERNAME,
-                                            proxy_password=WS_PASSWORD,
-                                            ))
+        self._youtube_api_key = youtube_api_key
+        # The googleapiclient (httplib2) and youtube_transcript_api (requests
+        # session) clients are NOT thread-safe — sharing one across the ingestion
+        # thread pool interleaves their TLS streams (SSL: WRONG_VERSION_NUMBER).
+        # So each thread lazily builds its own via the youtube/ytt_api properties.
+        self._thread_local = threading.local()
         # Disabled by default (see WHISPER_ENABLED)
         self.whisper_model = None
         if WHISPER_ENABLED:
@@ -108,7 +112,34 @@ class VideoIngestionPipeline:
         self.videos: dict[int, VideoList] = {}
         self._placement_by_id: dict[str, int] = {}
         self._channel_desc_cache: dict[str, str] = {}
+        # serializes the Chroma write + registry/placement mutation so concurrent
+        # ingestion workers (see ingest_video's thread pool) can't race on them.
+        self._write_lock = threading.Lock()
         self._rebuild_registry()
+
+    # -- per-thread clients ---------------------------------------------------------
+    # Built lazily, one set per thread, so the ingestion thread pool never shares a
+    # non-thread-safe HTTP transport. Every call site uses self.youtube/self.ytt_api
+    # unchanged.
+
+    @property
+    def youtube(self):
+        client = getattr(self._thread_local, "youtube", None)
+        if client is None:
+            client = discovery.build("youtube", "v3", developerKey=self._youtube_api_key)
+            self._thread_local.youtube = client
+        return client
+
+    @property
+    def ytt_api(self):
+        api = getattr(self._thread_local, "ytt_api", None)
+        if api is None:
+            api = YouTubeTranscriptApi(proxy_config=WebshareProxyConfig(
+                proxy_username=WS_USERNAME,
+                proxy_password=WS_PASSWORD,
+            ))
+            self._thread_local.ytt_api = api
+        return api
 
     # -- private helpers ------------------------------------------------------------
 
@@ -329,8 +360,40 @@ class VideoIngestionPipeline:
 
     # -- public interface (what agents call) ----------------------------------------
 
-    def ingest_video(self, url: str) -> dict:
-        """Full pipeline: fetch metadata + transcript, chunk, embed, store.
+    @traceable(run_type="chain", name="ingest_videos")
+    def ingest_video(self, url, max_workers: int = 5):
+        """Ingest one URL or many. Pass a single URL string to ingest one video
+        (returns one status dict), or a list of URLs to ingest them concurrently
+        on a bounded thread pool (returns one status dict per URL, in input order).
+        """
+        if isinstance(url, str):
+            return self._ingest_one(url)
+
+        urls = list(url)
+        if not urls:
+            return []
+
+        results: list = [None] * len(urls)
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(urls))) as ex:
+            futures = {ex.submit(self._ingest_one, u): i for i, u in enumerate(urls)}
+            for fut in as_completed(futures):
+                i = futures[fut]
+                try:
+                    results[i] = fut.result()
+                except Exception as e:
+                    # _ingest_one already returns dicts for known failures; this
+                    # only catches truly unexpected errors so one URL can't sink
+                    # the whole batch.
+                    results[i] = {
+                        "status": "error",
+                        "url": urls[i],
+                        "reason": f"{type(e).__name__}: {e}",
+                    }
+        return results
+    
+    def _ingest_one(self, url: str) -> dict:
+        """Full pipeline for a single URL: fetch metadata + transcript, chunk,
+        embed, store.
 
         Returns a status dict in every case — including failures — so the
         supervisor can react instead of the run crashing.
@@ -411,12 +474,14 @@ class VideoIngestionPipeline:
                                for _ in chunks]
 
             # remove any prior chunks for this video so re-ingestion can't duplicate,
-            # then add with deterministic IDs so the same chunk always upserts in place
-            self.vectorstore.delete(where={"video_id": video_id})
+            # then add with deterministic IDs so the same chunk always upserts in place.
+            # locked so concurrent workers can't corrupt the collection or race on
+            # placement assignment in _register_video.
             ids = [f"{video_id}-{i}" for i in range(len(chunks))]
-            self.vectorstore.add_texts(texts=chunks, metadatas=chunk_metadatas, ids=ids)
-
-            entry = self._register_video(full_record)
+            with self._write_lock:
+                self.vectorstore.delete(where={"video_id": video_id})
+                self.vectorstore.add_texts(texts=chunks, metadatas=chunk_metadatas, ids=ids)
+                entry = self._register_video(full_record)
 
             return {
                 "status": "ingested",
@@ -479,6 +544,61 @@ class VideoIngestionPipeline:
             })
         return results
 
+    def search_transcripts_multi(self, searches, k: int = 5, max_workers: int = 5) -> list[dict]:
+        """Run several transcript searches at once, concurrently.
+
+        Multi-query counterpart to search_transcripts (same relationship as
+        ingest_videos to ingest_video). Each item in `searches` is one search:
+        a dict with a "query" (required), an optional "video_id" to scope that
+        search to a single video, and an optional "k" to override the default
+        chunk count for that search. A bare string is also accepted and treated
+        as {"query": <string>}.
+
+        Runs the searches on a bounded thread pool and returns one result set
+        per input search, in input order, each a dict of
+        {query, video_id, results} where `results` is the list of chunk dicts
+        search_transcripts produces. A failure on one search is isolated (its
+        results come back empty) so it can't sink the rest of the batch.
+        """
+        items = list(searches)
+        if not items:
+            return []
+
+        def _normalize(item: object) -> dict:
+            if isinstance(item, str):
+                return {"query": item, "video_id": None, "k": k}
+            return {
+                "query": item.get("query"),
+                "video_id": item.get("video_id"),
+                "k": item.get("k", k),
+            }
+
+        specs = [_normalize(it) for it in items]
+
+        results: list = [None] * len(specs)
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(specs))) as ex:
+            futures = {
+                ex.submit(self.search_transcripts, spec["query"], spec["video_id"], spec["k"]): i
+                for i, spec in enumerate(specs)
+            }
+            for fut in as_completed(futures):
+                i = futures[fut]
+                spec = specs[i]
+                try:
+                    hits = fut.result()
+                except Exception as e:
+                    # search_transcripts already swallows its own errors, so this
+                    # only catches the truly unexpected and keeps one bad query
+                    # from sinking the batch.
+                    print(f"[search_transcripts_multi] query {spec['query']!r} failed: {type(e).__name__}: {e}")
+                    hits = []
+                results[i] = {
+                    "query": spec["query"],
+                    "video_id": spec["video_id"],
+                    "results": hits,
+                }
+        return results
+
     def search_youtube(self, query: str, channel: str = None, max_results: int = 5) -> list[dict]:
         """Search YouTube itself for videos matching a free-text query.
 
@@ -534,6 +654,16 @@ class VideoIngestionPipeline:
             return self.ingest_video(url)
 
         @tool
+        def ingest_videos(urls: list[str]) -> list[dict]:
+            """Ingest several YouTube videos at once (concurrently).
+
+            Use this instead of calling ingest_video repeatedly when the user gives
+            more than one URL. Pass a list of full YouTube URLs (watch, youtu.be, or
+            /shorts/); returns one status dict per URL, in the same order.
+            """
+            return self.ingest_video(urls)
+
+        @tool
         def search_transcripts(query: str, video_id: str = None, k: int = 5) -> list[dict]:
             """Semantic search over ingested video transcripts — use this to get
             context before answering a content question.
@@ -543,6 +673,21 @@ class VideoIngestionPipeline:
             scope the search to a single video, or omit it to search all videos.
             """
             return self.search_transcripts(query=query, video_id=video_id, k=k)
+
+        @tool
+        def search_transcripts_multi(searches: list[dict]) -> list[dict]:
+            """Run several transcript searches at once (concurrently).
+
+            Use this instead of calling search_transcripts repeatedly when you
+            have more than one thing to look up. Pass a list of search objects,
+            each shaped like:
+                {"query": "<text to search for>", "video_id": "<optional id to scope to one video>"}
+            video_id is optional — omit it to search across all videos. Returns
+            one result set per search, in the same order, each shaped as
+            {query, video_id, results}, where `results` is the usual list of
+            matching transcript chunks (text + source).
+            """
+            return self.search_transcripts_multi(searches)
 
         @tool
         def search_youtube(query: str, channel: str = None, max_results: int = 5) -> list[dict]:
@@ -579,7 +724,7 @@ class VideoIngestionPipeline:
             """
             return self.delete_video(video_id)
 
-        return [ingest_video, search_transcripts, search_youtube, get_video_info, list_videos, delete_video]
+        return [ingest_video, ingest_videos, search_transcripts, search_transcripts_multi, search_youtube, get_video_info, list_videos, delete_video]
 
     def get_retriever(self, video_id: str = None, k: int = 5):
         """Returns a retriever, optionally scoped to a single video."""
