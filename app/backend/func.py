@@ -6,9 +6,25 @@ from pathlib import Path
 from langchain.chat_models import init_chat_model
 
 from langgraph.graph.message import add_messages
+from langchain_core.messages.utils import trim_messages, count_tokens_approximately
 from langchain.tools import tool
 from typing import TypedDict, Annotated, Literal
 from pydantic import BaseModel, Field
+
+MAX_HISTORY_TOKENS = 12000
+
+def windowed_messages(left, right):
+    # Merge, then cap stored history so checkpoints don't grow unbounded.
+    merged = add_messages(left, right)
+    return trim_messages(
+        merged,
+        max_tokens=MAX_HISTORY_TOKENS,
+        token_counter=count_tokens_approximately,
+        strategy="last",
+        start_on="human",
+        include_system=True,
+        allow_partial=False,
+    )
 
 # --- Core ------------------------------------------------------------------
 
@@ -21,11 +37,11 @@ class IntentClassifier(BaseModel):
             "new_request: a question about video content not yet asked. "
             "  e.g. 'what bosses does he skip?' "
             "follow_up: references the previous answer; needs history to resolve referents. "
-            "  e.g. 'what about the second one?' — even if it adds a new sub-topic. "
-            "meta: about the assistant itself — its coverage, sources, or how it scores trust. "
+            "  e.g. 'what about the second one?', even if it adds a new sub-topic. "
+            "meta: about the assistant itself, its coverage, sources, or how it scores trust. "
             "  e.g. 'which videos do you have?', 'how do you decide a channel is credible?' "
             "chitchat: greeting, thanks, or social with no information need. e.g. 'hey', 'thanks!'"
-            "corpus_action: user is asking to change what content is loaded — fetch, add, switch collection"
+            "corpus_action: user is asking to change what content is loaded, fetch, add, switch collection"
             " e.g. 'can you get [x] video', 'can we change to [x] topic', 'can you forget about [x] video' "
         )
     )
@@ -35,17 +51,13 @@ class IntentClassifier(BaseModel):
     )
 
 class State(TypedDict):
-    messages: Annotated[list, add_messages]
+    messages: Annotated[list, windowed_messages]
     message_intent: str | None
     context: str | None
 
 class VideoList:
-    """A single ingested video's quick-access metadata.
-
-    The pipeline keeps one of these per video in an in-memory registry so an
-    agent tool can read a creator / title / stats directly by list placement,
-    instead of running a similarity search over the whole vector store.
-    """
+    """A single ingested video's quick-access metadata, kept per video in an in-memory
+    registry so an agent tool can read it by list placement without a similarity search."""
 
     def __init__(self, lst_placement, video_id, url, creator, creator_description,
                  title=None, channel_id=None, published_at=None,
@@ -82,27 +94,19 @@ class VideoList:
 
 
 class RAGEvaluator:
-    """
-    Purely local RAG evaluator using Gemini-as-judge.
-    No RAGAS, no LangSmith dataset — just CSV output + DataFrame.
+    """Local RAG evaluator using Gemini-as-judge, CSV output + DataFrame (no RAGAS/LangSmith).
 
-    Metrics (all scored 0.0 – 1.0 by Gemini):
-        Precision    – are the retrieved chunks relevant to the question?
-        Recall       – does the context cover the reference answer?
-        Faithfulness – is the answer grounded in the context (no hallucinations)?
-        Relevance    – does the answer actually address the question?
+    Metrics (all scored 0.0 to 1.0 by Gemini):
+        Precision    : are the retrieved chunks relevant to the question?
+        Recall       : does the context cover the reference answer?
+        Faithfulness : is the answer grounded in the context (no hallucinations)?
+        Relevance    : does the answer actually address the question?
     """
 
     RESULTS_DIR    = Path("../data/LS-results")
     QUESTIONS_PATH = Path("../data/LS-questions.csv")
 
     def __init__(self, graph, pipeline, api_key: str):
-        """
-        Args:
-            graph:    compiled LangGraph graph
-            pipeline: VideoIngestionPipeline (for vectorstore access)
-            api_key:  Gemini API key — uses gemini-2.5-flash-lite as judge
-        """
         self.graph    = graph
         self.pipeline = pipeline
 
@@ -154,13 +158,11 @@ class RAGEvaluator:
                 "content": (
                     "You are a strict evaluation assistant. "
                     "Respond with ONLY a single float between 0.0 and 1.0. "
-                    "No explanation, no extra text — just the number."
+                    "No explanation, no extra text, just the number."
                 )
             },
             {"role": "user", "content": prompt}
         ])
-        # print(response)
-        # raise KeyError
         try:
             return round(float(response.content[-1]["text"].strip()), 3)
         except ValueError:
@@ -303,15 +305,11 @@ Answer: {answer}
 class WikiVerifier:
     """Wikidata lookup helper for the verification agent.
 
-    Resolves a person's name to a Wikidata entity (QID) and pulls structured
-    facts — occupations, field of work, and education — that an answer can be
-    fact-checked against.
-
-    QIDs (e.g. "Q82955") are kept as the primary return value: they are a
-    language-independent, exact match key. The agent compares the QIDs found in
-    a person's claims against reference QIDs rather than fuzzy-matching strings.
-    `humanise_qid` is provided for when the LLM needs a readable label to put in
-    a prompt or answer.
+    Resolves a person's name to a Wikidata entity (QID) and pulls structured facts
+    (occupations, field of work, education) to fact-check an answer against. QIDs are
+    the primary return value: a language-independent, exact match key the agent compares
+    against rather than fuzzy-matching strings. `humanise_qid` resolves a QID to a
+    readable label when the LLM needs one in a prompt or answer.
     """
 
     WIKIDATA_API = "https://www.wikidata.org/w/api.php"
@@ -506,7 +504,7 @@ class WikiVerifier:
             """Look up a person on Wikidata by name and return their profile:
             occupations (P106), field_of_work (P101) and education (major/degree/
             educated_at) as Wikidata QIDs, plus the entity QID and wiki URL.
-            QIDs are exact, language-independent match keys — compare them against
+            QIDs are exact, language-independent match keys, compare them against
             reference QIDs. Returns {"error": ...} if no match is found."""
             return self.get_profile(name)
 
@@ -539,7 +537,7 @@ class WikiVerifier:
         @tool
         def wiki_search(query: str) -> list:
             """General Wikipedia search for ANY topic (events, places, concepts,
-            organisations — not just people). Returns the top matching articles as
+            organisations, not just people). Returns the top matching articles as
             {title, extract, url}, where extract is the article's plain-text intro.
             Use this to fact-check non-person claims."""
             return self.wiki_search(query)

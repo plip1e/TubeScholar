@@ -28,27 +28,18 @@ google_api_key = os.getenv("PAID_GEMINI_API") # FREE_GEMINI_API
 youtube_api_key = os.getenv("YOUTUBE_API_KEY")
 WS_USERNAME = os.getenv("WEBSHARE_PROXY_USERNAME")
 WS_PASSWORD = os.getenv("WEBSHARE_PROXY_PASSWORD")
-# Local Whisper speech-to-text is gated off by default while audio transcription
-# is being offloaded to an external Colab + FastAPI service (avoids loading the
-# model into memory on every startup). Set WHISPER_ENABLED=1 to re-enable it.
+# Local Whisper speech-to-text is gated off by default (audio transcription is being
+# offloaded to an external Colab + FastAPI service). Set WHISPER_ENABLED=1 to re-enable.
 WHISPER_ENABLED = os.getenv("WHISPER_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 class TranscriptUnavailable(Exception):
-    """No transcript could be produced (no captions, and Whisper is unavailable).
-
-    Carried up to ingest_video so it can return an agent-readable status with the
-    metadata the agent should fall back on, instead of crashing the run.
-    """
+    """No transcript could be produced (no captions, and Whisper is unavailable)."""
 
 
 def _youtube_error(e: HttpError) -> dict:
-    """Turn a googleapiclient HttpError into a flat, agent-readable dict.
-
-    Pulls the HTTP status and the API's own reason/message out of the error so a
-    tool can return something the supervisor can act on (e.g. quota exceeded vs.
-    the API/key being blocked) instead of crashing the run.
-    """
+    """Turn a googleapiclient HttpError into a flat, agent-readable dict so a tool can
+    return something the supervisor can act on instead of crashing the run."""
     status = getattr(getattr(e, "resp", None), "status", None)
     reason = ""
     message = str(e)
@@ -69,7 +60,7 @@ def _youtube_error(e: HttpError) -> dict:
         action = "The YouTube Data API rejected the request as malformed. Check the query/parameters."
     elif status == 404:
         action = ("The YouTube Data API returned 404 (not found). The requested resource/endpoint "
-                  "could not be located — check the method and that the YouTube Data API v3 is enabled "
+                  "could not be located, check the method and that the YouTube Data API v3 is enabled "
                   "for the key's project. Do not retry the identical request.")
     else:
         action = "The YouTube Data API call failed. Do not retry the identical request immediately."
@@ -87,10 +78,9 @@ class VideoIngestionPipeline:
     def __init__(self, google_api_key: str, youtube_api_key: str):
         self.max_age_days = 7
         self._youtube_api_key = youtube_api_key
-        # The googleapiclient (httplib2) and youtube_transcript_api (requests
-        # session) clients are NOT thread-safe — sharing one across the ingestion
-        # thread pool interleaves their TLS streams (SSL: WRONG_VERSION_NUMBER).
-        # So each thread lazily builds its own via the youtube/ytt_api properties.
+        # The googleapiclient and youtube_transcript_api clients are NOT thread-safe;
+        # sharing one across the ingestion thread pool interleaves their TLS streams
+        # (SSL: WRONG_VERSION_NUMBER), so each thread lazily builds its own below.
         self._thread_local = threading.local()
         # Disabled by default (see WHISPER_ENABLED)
         self.whisper_model = None
@@ -117,10 +107,8 @@ class VideoIngestionPipeline:
         self._write_lock = threading.Lock()
         self._rebuild_registry()
 
-    # -- per-thread clients ---------------------------------------------------------
-    # Built lazily, one set per thread, so the ingestion thread pool never shares a
-    # non-thread-safe HTTP transport. Every call site uses self.youtube/self.ytt_api
-    # unchanged.
+    # -- per-thread clients: built lazily, one set per thread, so the ingestion pool
+    #    never shares a non-thread-safe HTTP transport --------------------------------
 
     @property
     def youtube(self):
@@ -203,12 +191,8 @@ class VideoIngestionPipeline:
         }
 
     def _get_top_comments(self, video_id: str, max_comments: int = 15) -> list[dict]:
-        """Top-level comments by relevance — fallback overview material.
-
-        Used when a video has no usable transcript so the agent has the audience's
-        own words to infer what the video is about. Returns [] (never raises) if
-        comments are disabled, missing, or the call fails — it's optional context.
-        """
+        """Top-level comments by relevance, fallback overview material when a video has no
+        usable transcript. Returns [] (never raises) if comments are disabled or the call fails."""
         try:
             response = self.youtube.commentThreads().list(
                 part="snippet",
@@ -255,8 +239,7 @@ class VideoIngestionPipeline:
                     "transcript_source": "whisper"
                 }
             except Exception as we:
-                # Whisper fallback failed too (download blocked, no audio, ffmpeg
-                # missing, etc.). Surface it to the caller rather than crashing.
+                # Whisper fallback failed too; surface it to the caller rather than crashing.
                 raise TranscriptUnavailable(
                     f"Could not obtain a transcript for {video_id}: captions unavailable "
                     f"({type(e).__name__}) and Whisper fallback failed ({type(we).__name__}: {we})."
@@ -330,12 +313,9 @@ class VideoIngestionPipeline:
         return entry
 
     def _rebuild_registry(self) -> None:
-        """Repopulate the registry from the persisted vector store on startup.
-
-        Chunk metadata holds everything except the transcript, so previously
-        ingested videos are available to agent tools right after a restart.
-        Ordered by fetched_at so placements stay stable across runs.
-        """
+        """Repopulate the registry from the persisted vector store on startup, so previously
+        ingested videos are available to agent tools after a restart. Chunk metadata holds
+        everything except the transcript; ordered by fetched_at to keep placements stable."""
         self.videos = {}
         self._placement_by_id = {}
 
@@ -343,8 +323,7 @@ class VideoIngestionPipeline:
             stored = self.vectorstore.get()
             metadatas = stored.get("metadatas") or []
         except Exception as e:
-            # a corrupt/unreadable store shouldn't prevent the pipeline from
-            # starting — begin with an empty registry instead.
+            # a corrupt/unreadable store shouldn't stop startup; begin empty instead.
             print(f"[registry] could not load persisted store: {type(e).__name__}: {e}")
             return
 
@@ -395,7 +374,7 @@ class VideoIngestionPipeline:
         """Full pipeline for a single URL: fetch metadata + transcript, chunk,
         embed, store.
 
-        Returns a status dict in every case — including failures — so the
+        Returns a status dict in every case (including failures), so the
         supervisor can react instead of the run crashing.
         """
         try:
@@ -499,7 +478,7 @@ class VideoIngestionPipeline:
             }
 
     def get_video_info(self, placement: int = None, video_id: str = None) -> dict:
-        """Quick metadata lookup for an agent tool — no vector search.
+        """Quick metadata lookup for an agent tool, no vector search.
 
         Identify the video by its 1-based list placement (1, 2, ...) or its
         video_id. Returns the flat metadata dict, or a not_found status.
@@ -518,7 +497,7 @@ class VideoIngestionPipeline:
         return [self.videos[p].as_dict() for p in sorted(self.videos)]
 
     def search_transcripts(self, query: str, video_id: str = None, k: int = 5) -> list[dict]:
-        """Semantic search over ingested transcripts — the supervisor's context source.
+        """Semantic search over ingested transcripts, the supervisor's context source.
 
         Returns the top-k matching chunks (optionally scoped to one video) as
         dicts of {text, video_id, title, creator, url, placement}, so an agent
@@ -602,7 +581,7 @@ class VideoIngestionPipeline:
     def search_youtube(self, query: str, channel: str = None, max_results: int = 5) -> list[dict]:
         """Search YouTube itself for videos matching a free-text query.
 
-        Use this to find a video that hasn't been ingested yet — it hits the
+        Use this to find a video that hasn't been ingested yet, it hits the
         YouTube Data API's search endpoint, not the local store. Optionally bias
         toward a creator by passing `channel` (appended to the query). Returns
         candidate {title, creator, video_id, url, published_at} dicts the agent
@@ -634,13 +613,11 @@ class VideoIngestionPipeline:
         return results
 
     def get_tools(self) -> list:
-        """LangChain tools bound to this pipeline — the full toolset the supervisor gets.
+        """LangChain tools bound to this pipeline, the full toolset the supervisor gets.
 
-        Each tool is a closure over `self`, so its schema shows only the real
-        arguments, not `self`. Covers the whole pipeline surface the supervisor
-        needs: ingest new videos, retrieve context to answer from, find videos on
-        YouTube that aren't ingested yet, look up/list metadata, and remove videos.
-        Append more here as they're tested.
+        Each tool is a closure over `self`, so its schema shows only the real arguments.
+        Covers the whole pipeline surface: ingest videos, retrieve context, find videos
+        on YouTube, look up/list metadata, and remove videos.
         """
         @tool
         def ingest_video(url: str) -> dict:
@@ -665,7 +642,7 @@ class VideoIngestionPipeline:
 
         @tool
         def search_transcripts(query: str, video_id: str = None, k: int = 5) -> list[dict]:
-            """Semantic search over ingested video transcripts — use this to get
+            """Semantic search over ingested video transcripts, use this to get
             context before answering a content question.
 
             Returns the top-k matching transcript chunks, each with its text and
@@ -682,7 +659,7 @@ class VideoIngestionPipeline:
             have more than one thing to look up. Pass a list of search objects,
             each shaped like:
                 {"query": "<text to search for>", "video_id": "<optional id to scope to one video>"}
-            video_id is optional — omit it to search across all videos. Returns
+            video_id is optional, omit it to search across all videos. Returns
             one result set per search, in the same order, each shaped as
             {query, video_id, results}, where `results` is the usual list of
             matching transcript chunks (text + source).
@@ -703,7 +680,7 @@ class VideoIngestionPipeline:
 
         @tool
         def get_video_info(placement: int = None, video_id: str = None) -> dict:
-            """Look up an ingested video's metadata — no vector search.
+            """Look up an ingested video's metadata, no vector search.
 
             Identify the video by its 1-based list placement (1, 2, ...) or its
             video_id. Returns a flat dict (creator, creator_description, title,
@@ -749,10 +726,10 @@ class VideoIngestionPipeline:
         return {"status": "deleted", "video_id": video_id}
 
     def clear_all(self) -> dict:
-        """Wipe every ingested video — drops all vectors and resets the registry.
+        """Wipe every ingested video, dropping all vectors and resetting the registry.
 
-        Useful for a clean test run. `reset_collection` deletes and recreates the
-        underlying Chroma collection, so placements start from 1 again afterwards.
+        `reset_collection` deletes and recreates the underlying Chroma collection,
+        so placements start from 1 again afterwards.
         """
         video_count = len(self.videos)
         try:
