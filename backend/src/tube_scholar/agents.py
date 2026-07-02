@@ -1,25 +1,20 @@
-from dotenv import load_dotenv
-import os, uuid
+''' File that defines the agents used in the backend of the application. '''
 
 from langchain.agents import create_agent
-from langchain.chat_models import init_chat_model
-from func import State, WikiVerifier
 
-load_dotenv()
-UTUBE_API = os.getenv("YOUTUBE_API_KEY")
-GEMINI_API = os.getenv("PAID_GEMINI_API") # PAID_GEMINI_API / FREE_GEMINI_API
+from tube_scholar.core.config import settings
+from tube_scholar.core.models import chat_model
+from tube_scholar.func import WikiVerifier
 
-temp = .7
+TEMP = .7
 
-llm = init_chat_model(
-    model="google_genai:gemini-3.1-flash-lite",
-    api_key=GEMINI_API,
-    temperature=temp,
-)
+# Provider-agnostic: provider comes from the MAIN_MODEL prefix; the provider SDK
+# reads its own key from the environment (loaded via core.config).
+llm = chat_model(settings.main_model, temperature=TEMP)
 
 # --- Verification Agent -------------------------------------------------------------
 
-verification_system_message = """
+VERIFICATION_SYSTEM_MESSAGE = """
 You proof-read a candidate answer against the context it was drawn from and flag misinformation.
 
 Given the drafted answer (and any context provided), check each claim:
@@ -29,6 +24,10 @@ Given the drafted answer (and any context provided), check each claim:
 Respond with:
 - VERDICT: pass | revise
 - A short bullet list of any flagged claims and why. If nothing is wrong, say so.
+- SOURCES CHECKED: list every Wikipedia/Wikidata lookup you actually performed as
+  "<tool> -> <entity/query>" (e.g. "get_profile -> Ada Lovelace"), or the single word
+  "none" if you did not call any wiki tool. Report this honestly based on the tools you
+  used, not the tools you could have used.
 Do not rewrite the answer yourself, just flag. Be concise.
 
 When a claim concerns a real person (e.g. their occupation, field, or education),
@@ -49,7 +48,7 @@ wiki = WikiVerifier()
 verification_agent = create_agent(
     model=llm,
     tools=list(wiki.get_tools().values()),
-    system_prompt=verification_system_message,
+    system_prompt=VERIFICATION_SYSTEM_MESSAGE,
     name="verification_agent",
 )
 

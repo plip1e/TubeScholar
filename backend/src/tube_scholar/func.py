@@ -1,19 +1,26 @@
-import os, time
+''' File that defines the core backend functions and classes for the application. '''
+
+from pathlib import Path
+from typing import TypedDict, Annotated, Literal
 import uuid
+from pydantic import BaseModel, Field
 import requests
 import pandas as pd
-from pathlib import Path
-from langchain.chat_models import init_chat_model
 
+from langchain.tools import tool
 from langgraph.graph.message import add_messages
 from langchain_core.messages.utils import trim_messages, count_tokens_approximately
-from langchain.tools import tool
-from typing import TypedDict, Annotated, Literal
-from pydantic import BaseModel, Field
+
+from tube_scholar.core.config import settings
+from tube_scholar.core.models import chat_model
 
 MAX_HISTORY_TOKENS = 12000
 
 def windowed_messages(left, right):
+    """
+    Combine two message lists, then trim to a max token count.
+    Keeps the last N tokens, starting on a human message, and includes the system message.
+    """
     # Merge, then cap stored history so checkpoints don't grow unbounded.
     merged = add_messages(left, right)
     return trim_messages(
@@ -29,6 +36,7 @@ def windowed_messages(left, right):
 # --- Core ------------------------------------------------------------------
 
 class IntentClassifier(BaseModel):
+    '''Classify a user message into one of several intents for routing in the graph.'''
     reasoning: str = Field(
         description="One sentence: why this turn falls into the chosen intent."
     )
@@ -41,8 +49,10 @@ class IntentClassifier(BaseModel):
             "meta: about the assistant itself, its coverage, sources, or how it scores trust. "
             "  e.g. 'which videos do you have?', 'how do you decide a channel is credible?' "
             "chitchat: greeting, thanks, or social with no information need. e.g. 'hey', 'thanks!'"
-            "corpus_action: user is asking to change what content is loaded, fetch, add, switch collection"
-            " e.g. 'can you get [x] video', 'can we change to [x] topic', 'can you forget about [x] video' "
+            "corpus_action: "
+            " user is asking to change what content is loaded, fetch, add, switch collection"
+            " e.g. 'can you get [x] video', "
+            "'can we change to [x] topic', 'can you forget about [x] video' "
         )
     )
     needs_clarification: bool = Field(
@@ -51,11 +61,12 @@ class IntentClassifier(BaseModel):
     )
 
 class State(TypedDict):
+    '''State of the conversation, stored in the supervisor's thread_config.'''
     messages: Annotated[list, windowed_messages]
     message_intent: str | None
     context: str | None
 
-class VideoList:
+class VideoList: # pylint: disable=too-many-instance-attributes, too-few-public-methods
     """A single ingested video's quick-access metadata, kept per video in an in-memory
     registry so an agent tool can read it by list placement without a similarity search."""
 
@@ -103,18 +114,16 @@ class RAGEvaluator:
         Relevance    : does the answer actually address the question?
     """
 
-    RESULTS_DIR    = Path("../data/LS-results")
-    QUESTIONS_PATH = Path("../data/LS-questions.csv")
+    RESULTS_DIR    = Path("data/LS-results")
+    QUESTIONS_PATH = Path("data/LS-questions.csv")
 
-    def __init__(self, graph, pipeline, api_key: str):
+    def __init__(self, graph, pipeline):
         self.graph    = graph
         self.pipeline = pipeline
 
-        self.llm = init_chat_model(
-            model="google_genai:gemini-3.1-flash-lite",
-            api_key=api_key,
-            temperature=0
-        )
+        # Provider-agnostic: same MAIN_MODEL config as the rest of the app; the
+        # provider SDK reads its own key from the environment.
+        self.llm = chat_model(settings.main_model, temperature=0)
 
         self.examples = self._load_examples()
         self.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -172,43 +181,46 @@ class RAGEvaluator:
 
     def _precision(self, question: str, contexts: list[str]) -> float:
         ctx = "\n\n".join(f"[{i+1}] {c}" for i, c in enumerate(contexts))
-        return self._score(f"""Score how relevant the retrieved context chunks are to the question.
+        return self._score(f"""
+                        Score how relevant the retrieved context chunks are to the question.
 
-Question: {question}
+                        Question: {question}
 
-Retrieved Contexts:
-{ctx}
+                        Retrieved Contexts:
+                        {ctx}
 
-1.0 = all chunks are highly relevant to the question
-0.5 = some chunks are relevant, some are off-topic
-0.0 = none of the chunks are relevant to the question""")
+                        1.0 = all chunks are highly relevant to the question
+                        0.5 = some chunks are relevant, some are off-topic
+                        0.0 = none of the chunks are relevant to the question""")
 
     def _recall(self, question: str, contexts: list[str], reference: str) -> float:
         ctx = "\n\n".join(f"[{i+1}] {c}" for i, c in enumerate(contexts))
-        return self._score(f"""Score whether the retrieved context contains enough information to produce the reference answer.
+        return self._score(f"""
+            Score whether the retrieved context contains enough information to produce the reference answer.
 
-Question: {question}
-Reference Answer: {reference}
+            Question: {question}
+            Reference Answer: {reference}
 
-Retrieved Contexts:
-{ctx}
+            Retrieved Contexts:
+            {ctx}
 
-1.0 = context fully covers everything needed for the reference answer
-0.5 = context partially covers it, some key info is missing
-0.0 = context is missing most or all of the key information""")
+            1.0 = context fully covers everything needed for the reference answer
+            0.5 = context partially covers it, some key info is missing
+            0.0 = context is missing most or all of the key information""")
 
     def _faithfulness(self, answer: str, contexts: list[str]) -> float:
         ctx = "\n\n".join(f"[{i+1}] {c}" for i, c in enumerate(contexts))
-        return self._score(f"""Score whether every claim in the answer is supported by the retrieved context.
+        return self._score(f"""
+                Score whether every claim in the answer is supported by the retrieved context.
 
-Answer: {answer}
+                Answer: {answer}
 
-Retrieved Contexts:
-{ctx}
+                Retrieved Contexts:
+                {ctx}
 
-1.0 = every claim in the answer is directly supported by the context
-0.5 = most claims are supported but some appear to be inferred or hallucinated
-0.0 = the answer contains claims that contradict or are absent from the context""")
+                1.0 = every claim in the answer is directly supported by the context
+                0.5 = most claims are supported but some appear to be inferred or hallucinated
+                0.0 = the answer contains claims that contradict or are absent from the context""")
 
     def _relevance(self, question: str, answer: str) -> float:
         return self._score(f"""Score how directly and completely the answer addresses the question.
@@ -225,22 +237,23 @@ Answer: {answer}
     # ------------------------------------------------------------------
 
     def get_tools(self) -> dict:
+        '''Return the scoring functions as tools for the supervisor to call.'''
 
         @tool
         def precision(question: str, contexts: list[str]) -> float:
 
             return self._precision(question, contexts)
-        
+
         @tool
         def recall(question: str, contexts: list[str], reference: str) -> float:
 
             return self._recall(question, contexts, reference)
-        
+
         @tool
         def faithfulness(answer: str, contexts: list[str]) -> float:
 
             return self._faithfulness(answer, contexts)
-        
+
         @tool
         def relevance(question: str, answer: list[str]) -> float:
 
@@ -275,11 +288,11 @@ Answer: {answer}
                 "Relevance":   self._relevance(ex["question"], out["answer"]),
             })
             print(f"""
-                       P={rows[-1]['Precision']}  R={rows[-1]['Recall']}  
+                       P={rows[-1]['Precision']}  R={rows[-1]['Recall']}
                        F={rows[-1]['Faithfulness']}  Rel={rows[-1]['Relevance']}""")
-            
-            with open('res.txt', 'a') as a:
-                a.write(f"CONTEXTS:, {out["contexts"]}\nANSWER:, {out["answer"]}\n\n")
+
+            with open('res.txt', 'a', encoding='utf-8') as a:
+                a.write(f"CONTEXTS:, {out['contexts']}\nANSWER:, {out['answer']}\n\n")
 
         df = pd.DataFrame(rows)
 
@@ -498,6 +511,7 @@ class WikiVerifier:
         ]
 
     def get_tools(self) -> dict:
+        """Return the verification functions as tools for the agent to call."""
 
         @tool
         def get_profile(name: str) -> dict:
@@ -553,4 +567,3 @@ class WikiVerifier:
 
 
 # ---------------------------------------------------------------------------
-

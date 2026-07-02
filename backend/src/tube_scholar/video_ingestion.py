@@ -1,33 +1,54 @@
-'''This module holds the agent that ingests videos using the given URL, vectorises them, and adds them to the Chromadb database'''
+'''This module holds the agent that ingests videos using the given URL, 
+    vectorises them, and adds them to the Chromadb database'''
 
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dotenv import load_dotenv
-from datetime import datetime
-
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, CouldNotRetrieveTranscript
-from requests.exceptions import RequestException
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
+import re
 from urllib.parse import urlparse, parse_qs
+from datetime import datetime
+from dotenv import load_dotenv
+
+from youtube_transcript_api.proxies import WebshareProxyConfig
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled
+from youtube_transcript_api import NoTranscriptFound, CouldNotRetrieveTranscript
+
+from langchain.embeddings import init_embeddings
 from langchain_core.tools import tool
+from langchain_chroma import Chroma
 from langsmith import traceable
+
+from requests.exceptions import RequestException
 from googleapiclient import discovery
 from googleapiclient.errors import HttpError
-from langchain_chroma import Chroma
-import chromadb, yt_dlp
+import yt_dlp
 
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api.proxies import WebshareProxyConfig
-
-from func import VideoList
+from tube_scholar.func import VideoList
 
 
 load_dotenv()
-google_api_key = os.getenv("PAID_GEMINI_API") # FREE_GEMINI_API
-youtube_api_key = os.getenv("YOUTUBE_API_KEY")
+MODEL_NAME = os.getenv("MAIN_MODEL")
+# Provider-prefixed embedding model, e.g. "google_genai:models/gemini-embedding-001"
+# or "openai:text-embedding-3-small". init_embeddings picks the provider from the prefix.
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "google_genai:models/gemini-embedding-001")
+
+
+def collection_name_for(embedding_model: str) -> str:
+    '''Derive a Chroma collection name from the embedding model.
+
+    Different embedding models produce different-sized vectors, and a Chroma
+    collection is locked to one dimension. Giving each embedding model its own
+    collection means switching providers can't corrupt an existing index — each
+    keeps its own. Re-ingest once per embedding model you use.
+    '''
+    slug = re.sub(r"[^a-z0-9]+", "_", embedding_model.lower()).strip("_")
+    return f"youtube_videos_{slug}"
+
 WS_USERNAME = os.getenv("WEBSHARE_PROXY_USERNAME")
 WS_PASSWORD = os.getenv("WEBSHARE_PROXY_PASSWORD")
+# Anchored to a fixed location (relative to where the app is launched — the project
+# root) rather than to __file__, so moving this module doesn't repoint the vector DB.
+CHROMA_DIR = os.getenv("CHROMA_DIR", "data/chroma_db")
 # Local Whisper speech-to-text is gated off by default (audio transcription is being
 # offloaded to an external Colab + FastAPI service). Set WHISPER_ENABLED=1 to re-enable.
 WHISPER_ENABLED = os.getenv("WHISPER_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
@@ -47,20 +68,24 @@ def _youtube_error(e: HttpError) -> dict:
         details = (e.error_details or [{}])[0] if hasattr(e, "error_details") else {}
         reason = details.get("reason", "")
         message = details.get("message", message)
-    except Exception:
+    except Exception: # pylint: disable=broad-except
         pass
 
     if status == 403 and ("blocked" in message.lower() or reason == "forbidden"):
-        action = ("The YouTube Data API request was blocked. Check that the API key is valid, "
+        action = ("The YouTube Data API request was blocked. Check that the API key is valid,"
                   "that the YouTube Data API v3 is enabled for its project, and that any API/IP/"
-                  "referrer restrictions on the key allow this call. Do not retry until the key is fixed.")
+                  "referrer restrictions on the key allow this call. "
+                  "Do not retry until the key is fixed.")
     elif status == 403 and reason in ("quotaExceeded", "rateLimitExceeded"):
-        action = "The YouTube Data API quota/rate limit was hit. Wait and retry later, or ask the user for a fresh quota."
+        action = "The YouTube Data API quota/rate limit was hit." \
+                "Wait and retry later, or ask the user for a fresh quota."
     elif status == 400:
-        action = "The YouTube Data API rejected the request as malformed. Check the query/parameters."
+        action = "The YouTube Data API rejected the request as malformed." \
+                "Check the query/parameters."
     elif status == 404:
         action = ("The YouTube Data API returned 404 (not found). The requested resource/endpoint "
-                  "could not be located, check the method and that the YouTube Data API v3 is enabled "
+                  "could not be located,"
+                  "check the method and that the YouTube Data API v3 is enabled "
                   "for the key's project. Do not retry the identical request.")
     else:
         action = "The YouTube Data API call failed. Do not retry the identical request immediately."
@@ -74,8 +99,10 @@ def _youtube_error(e: HttpError) -> dict:
     }
 
 
-class VideoIngestionPipeline:
-    def __init__(self, google_api_key: str, youtube_api_key: str):
+class VideoIngestionPipeline: # pylint: disable=too-many-instance-attributes
+    '''Pipeline for ingesting YouTube videos: fetch metadata, 
+        transcript, chunk, embed, and store.'''
+    def __init__(self, youtube_api_key: str, embedding_model: str | None = None, chroma_dir: str | None = None): # pylint: disable=redefined-outer-name
         self.max_age_days = 7
         self._youtube_api_key = youtube_api_key
         # The googleapiclient and youtube_transcript_api clients are NOT thread-safe;
@@ -85,17 +112,17 @@ class VideoIngestionPipeline:
         # Disabled by default (see WHISPER_ENABLED)
         self.whisper_model = None
         if WHISPER_ENABLED:
-            import whisper
+            import whisper # pylint: disable=import-outside-toplevel
             self.whisper_model = whisper.load_model("base")
-        self.embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/gemini-embedding-001",
-            google_api_key=google_api_key
-        )
+        # Provider-agnostic: init_embeddings reads the provider from the model prefix
+        # and that provider's SDK reads its own API key from the environment.
+        embedding_model = embedding_model or EMBEDDING_MODEL
+        self.embeddings = init_embeddings(embedding_model)
         self.vectorstore = Chroma(
-            collection_name="youtube_videos",
+            # one collection per embedding model so differing vector dims never clash
+            collection_name=collection_name_for(embedding_model),
             embedding_function=self.embeddings,
-            # anchored to app/data so the same DB is used
-            persist_directory=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "chroma_db")
+            persist_directory=chroma_dir or CHROMA_DIR,
         )
 
         # quick-access metadata registry
@@ -112,6 +139,7 @@ class VideoIngestionPipeline:
 
     @property
     def youtube(self):
+        '''googleapiclient.discovery build of the YouTube Data API v3, cached per thread.'''
         client = getattr(self._thread_local, "youtube", None)
         if client is None:
             client = discovery.build("youtube", "v3", developerKey=self._youtube_api_key)
@@ -120,6 +148,7 @@ class VideoIngestionPipeline:
 
     @property
     def ytt_api(self):
+        '''youtube_transcript_api YouTubeTranscriptApi instance, cached per thread.'''
         api = getattr(self._thread_local, "ytt_api", None)
         if api is None:
             api = YouTubeTranscriptApi(proxy_config=WebshareProxyConfig(
@@ -149,7 +178,7 @@ class VideoIngestionPipeline:
         if channel_id in self._channel_desc_cache:
             return self._channel_desc_cache[channel_id]
         try:
-            response = self.youtube.channels().list(
+            response = self.youtube.channels().list( # pylint: disable=no-member
                 part="snippet",
                 id=channel_id
             ).execute()
@@ -157,13 +186,14 @@ class VideoIngestionPipeline:
             description = items[0]["snippet"]["description"] if items else ""
         except (HttpError, KeyError, IndexError) as e:
             # description is optional metadata; never let it sink an ingestion
-            print(f"[channel] could not fetch description for {channel_id}: {type(e).__name__}: {e}")
+            print(f"""[channel] could not fetch description for
+                    {channel_id}: {type(e).__name__}: {e}""")
             description = ""
         self._channel_desc_cache[channel_id] = description
         return description
 
     def _get_metadata(self, video_id: str) -> dict:
-        response = self.youtube.videos().list(
+        response = self.youtube.videos().list( # pylint: disable=no-member
             part="snippet,statistics,contentDetails",
             id=video_id
         ).execute()
@@ -194,7 +224,7 @@ class VideoIngestionPipeline:
         """Top-level comments by relevance, fallback overview material when a video has no
         usable transcript. Returns [] (never raises) if comments are disabled or the call fails."""
         try:
-            response = self.youtube.commentThreads().list(
+            response = self.youtube.commentThreads().list( # pylint: disable=no-member
                 part="snippet",
                 videoId=video_id,
                 order="relevance",
@@ -203,7 +233,8 @@ class VideoIngestionPipeline:
             ).execute()
         except HttpError as e:
             status = getattr(getattr(e, "resp", None), "status", None)
-            print(f"[comments] could not fetch comments for {video_id} (HTTP {status}); likely disabled")
+            print(f"""[comments] could not fetch comments for
+                  {video_id} (HTTP {status}); likely disabled""")
             return []
         comments = []
         for item in response.get("items") or []:
@@ -224,7 +255,8 @@ class VideoIngestionPipeline:
                 "transcript": " ".join([s.text for s in fetched.snippets]),
                 "transcript_source": "captions"
             }
-        except (TranscriptsDisabled, NoTranscriptFound, CouldNotRetrieveTranscript, RequestException) as e:
+        except (TranscriptsDisabled, NoTranscriptFound,
+                CouldNotRetrieveTranscript, RequestException) as e:
             if not (WHISPER_ENABLED and self.whisper_model is not None):
                 # Whisper fallback is currently disabled
                 raise TranscriptUnavailable(
@@ -232,7 +264,8 @@ class VideoIngestionPipeline:
                     f"speech-to-text is currently unavailable."
                 ) from e
             # Whisper enabled: download the audio and transcribe it locally
-            print(f"[transcript] captions unavailable for {video_id} ({type(e).__name__}); falling back to Whisper")
+            print(f"""[transcript] captions unavailable for
+                  {video_id} ({type(e).__name__}); falling back to Whisper""")
             try:
                 return {
                     "transcript": self._whisper_transcribe(video_id),
@@ -322,7 +355,7 @@ class VideoIngestionPipeline:
         try:
             stored = self.vectorstore.get()
             metadatas = stored.get("metadatas") or []
-        except Exception as e:
+        except Exception as e: # pylint: disable=broad-except
             # a corrupt/unreadable store shouldn't stop startup; begin empty instead.
             print(f"[registry] could not load persisted store: {type(e).__name__}: {e}")
             return
@@ -359,7 +392,7 @@ class VideoIngestionPipeline:
                 i = futures[fut]
                 try:
                     results[i] = fut.result()
-                except Exception as e:
+                except Exception as e: # pylint: disable=broad-except
                     # _ingest_one already returns dicts for known failures; this
                     # only catches truly unexpected errors so one URL can't sink
                     # the whole batch.
@@ -369,8 +402,8 @@ class VideoIngestionPipeline:
                         "reason": f"{type(e).__name__}: {e}",
                     }
         return results
-    
-    def _ingest_one(self, url: str) -> dict:
+
+    def _ingest_one(self, url: str) -> dict: # pylint: disable=too-many-locals,too-many-statements
         """Full pipeline for a single URL: fetch metadata + transcript, chunk,
         embed, store.
 
@@ -384,7 +417,8 @@ class VideoIngestionPipeline:
                 "status": "invalid_url",
                 "url": url,
                 "reason": str(e),
-                "action": "Ask the user for a valid, public YouTube URL (watch, youtu.be, or /shorts/).",
+                "action": """Ask the user for a valid,
+                            public YouTube URL (watch, youtu.be, or /shorts/).""",
             }
 
         try:
@@ -400,8 +434,12 @@ class VideoIngestionPipeline:
                 return {
                     "status": "not_found",
                     "video_id": video_id,
-                    "reason": "No video could be retrieved for this URL. The video is likely invalid, private, deleted, or region-blocked.",
-                    "action": "Do not retry the same URL. If the user named a specific video or channel, search for the closest matching video and confirm it with them before ingesting. Otherwise, ask the user to provide a valid, public YouTube URL.",
+                    "reason": """No video could be retrieved for this URL. 
+                            The video is likely invalid, private, deleted, or region-blocked.""",
+                    "action": """Do not retry the same URL.
+                            If the user named a specific video or channel,
+                            search for the closest matching video and confirm it with them before ingesting. 
+                            Otherwise, ask the user to provide a valid, public YouTube URL.""",
                 }
 
             try:
@@ -425,13 +463,13 @@ class VideoIngestionPipeline:
                         "top_comments": self._get_top_comments(video_id),
                     },
                     "action": (
-                        "This video could not be ingested: it has no captions/transcript and "
-                        "automatic speech-to-text (Whisper) is currently unavailable. Do NOT retry "
-                        "ingestion. Be transparent with the user that there is no transcript or "
-                        "captions for this video. Then use the fields in metadata_overview (title, "
-                        "description, channel_description, and top_comments) to write a brief overview "
-                        "of what the video is likely about. Make clear this is inferred from the "
-                        "video's metadata and audience comments, not from its actual spoken content."
+                    "This video could not be ingested: it has no captions/transcript and "
+                    "automatic speech-to-text (Whisper) is currently unavailable. Do NOT retry "
+                    "ingestion. Be transparent with the user that there is no transcript or "
+                    "captions for this video. Then use the fields in metadata_overview (title, "
+                    "description, channel_description, and top_comments) to write a brief overview "
+                    "of what the video is likely about. Make clear this is inferred from the "
+                    "video's metadata and audience comments, not from its actual spoken content."
                     ),
                 }
 
@@ -468,13 +506,15 @@ class VideoIngestionPipeline:
                 "chunks": len(chunks),
                 "lst_placement": entry.lst_placement,
             }
-        except Exception as e:
+        except Exception as e: # pylint: disable=broad-except
             print(f"[ingest] failed for {video_id}: {type(e).__name__}: {e}")
             return {
                 "status": "error",
                 "video_id": video_id,
                 "reason": f"{type(e).__name__}: {e}",
-                "action": "An unexpected error occurred while ingesting. Do not retry the same URL repeatedly; tell the user ingestion failed.",
+                "action": "An unexpected error occurred while ingesting."
+                "Do not retry the same URL repeatedly;"
+                "tell the user ingestion failed.",
             }
 
     def get_video_info(self, placement: int = None, video_id: str = None) -> dict:
@@ -506,7 +546,7 @@ class VideoIngestionPipeline:
         try:
             retriever = self.get_retriever(video_id=video_id, k=k)
             docs = retriever.invoke(query)
-        except Exception as e:
+        except Exception as e: # pylint: disable=broad-except
             print(f"[search_transcripts] query failed: {type(e).__name__}: {e}")
             return []
         results = []
@@ -565,11 +605,12 @@ class VideoIngestionPipeline:
                 spec = specs[i]
                 try:
                     hits = fut.result()
-                except Exception as e:
+                except Exception as e: # pylint: disable=broad-except
                     # search_transcripts already swallows its own errors, so this
                     # only catches the truly unexpected and keeps one bad query
                     # from sinking the batch.
-                    print(f"[search_transcripts_multi] query {spec['query']!r} failed: {type(e).__name__}: {e}")
+                    print(f"""[search_transcripts_multi] query
+                          {spec['query']!r} failed: {type(e).__name__}: {e}""")
                     hits = []
                 results[i] = {
                     "query": spec["query"],
@@ -589,7 +630,7 @@ class VideoIngestionPipeline:
         """
         q = f"{query} {channel}" if channel else query
         try:
-            response = self.youtube.search().list(
+            response = self.youtube.search().list( # pylint: disable=no-member
                 part="snippet",
                 q=q,
                 type="video",
@@ -701,7 +742,9 @@ class VideoIngestionPipeline:
             """
             return self.delete_video(video_id)
 
-        return [ingest_video, ingest_videos, search_transcripts, search_transcripts_multi, search_youtube, get_video_info, list_videos, delete_video]
+        return [ingest_video, ingest_videos, search_transcripts,
+                search_transcripts_multi, search_youtube,
+                get_video_info, list_videos, delete_video]
 
     def get_retriever(self, video_id: str = None, k: int = 5):
         """Returns a retriever, optionally scoped to a single video."""
@@ -716,7 +759,7 @@ class VideoIngestionPipeline:
             return {"status": "error", "reason": "No video_id provided."}
         try:
             self.vectorstore.delete(where={"video_id": video_id})
-        except Exception as e:
+        except Exception as e: # pylint: disable=broad-except
             print(f"[delete] failed for {video_id}: {type(e).__name__}: {e}")
             return {"status": "error", "video_id": video_id, "reason": f"{type(e).__name__}: {e}"}
         # drop it from the registry too; surviving videos keep their placement
@@ -734,14 +777,14 @@ class VideoIngestionPipeline:
         video_count = len(self.videos)
         try:
             self.vectorstore.reset_collection()
-        except Exception as e:
+        except Exception as e: # pylint: disable=broad-except
             print(f"[clear_all] failed: {type(e).__name__}: {e}")
             return {"status": "error", "reason": f"{type(e).__name__}: {e}"}
         self.videos = {}
         self._placement_by_id = {}
         self._channel_desc_cache = {}
         return {"status": "cleared", "videos_removed": video_count}
-    
+
 
 
 if __name__ == "__main__":

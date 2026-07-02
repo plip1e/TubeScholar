@@ -1,0 +1,71 @@
+[project]
+name = "TubeScholar"
+version = "0.6"
+requires-python = ">=3.11"
+dependencies = [
+    # --- LLM / agent orchestration ---
+    "langchain>=1.3",
+    "langgraph>=1.2",
+    "langgraph-supervisor>=0.0.31",
+    "langgraph-checkpoint-sqlite>=3.1",   # AsyncSqliteSaver checkpointer
+    "langchain-google-genai>=4.2",        # Gemini chat + embeddings (google_genai:*)
+    "langchain-chroma>=1.1",              # vector store wrapper
+    "chromadb>=1.5",                      # backing vector DB
+
+    # --- data / validation ---
+    "pydantic>=2.13",
+    "pydantic-settings>=2.14",            # typed settings from env (.env)
+    "pandas>=3.0",
+
+    # --- video ingestion ---
+    "youtube-transcript-api>=1.2",
+    "yt-dlp>=2026.3",
+    "google-api-python-client>=2.19",     # YouTube Data API (googleapiclient)
+
+    # --- infra / runtime ---
+    "python-dotenv>=1.2",
+    "aiosqlite>=0.22",
+    "requests>=2.34",
+
+    # --- web API (FastAPI backend) ---
+    "fastapi>=0.136",
+    "uvicorn[standard]>=0.49",            # ASGI server
+    "sse-starlette>=3.4",                 # Server-Sent Events for token streaming
+    "python-multipart>=0.0.32",           # form/file uploads
+
+    # --- legacy prototype UI (kept as debug tool during migration) ---
+    "chainlit>=2.11",
+]
+
+[project.optional-dependencies]
+# --- LLM providers ---------------------------------------------------------
+# Google (Gemini) ships as a core dependency, so it works out of the box.
+# For a different provider, install its extra, e.g.  pip install -e ".[openai]".
+# Set MAIN_MODEL / EMBEDDING_MODEL to that provider's prefix and put its key in .env.
+openai = ["langchain-openai>=0.2"]        # openai:gpt-*, openai:text-embedding-3-*
+anthropic = ["langchain-anthropic>=0.3"]  # anthropic:claude-*  (chat only; no embeddings)
+all = [
+    "langchain-openai>=0.2",
+    "langchain-anthropic>=0.3",
+]
+
+dev = [
+    "langsmith>=0.8",     # tracing
+    "pytest>=8.0",
+    "httpx>=0.28",        # FastAPI TestClient
+    "ipykernel>=7.0",     # notebooks
+]
+
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# src layout: the importable package lives at backend/src/tube_scholar
+[tool.setuptools.packages.find]
+where = ["backend/src"]
+
+[project.scripts]
+tubescholar = "tube_scholar.main:main"
+
+[tool.pytest.ini_options]
+testpaths = ["backend/tests"]

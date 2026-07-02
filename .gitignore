@@ -1,14 +1,23 @@
-/app/data/*
+# Local data: vector DB, checkpoints, transcripts, eval CSVs
+/data/
 YT project/
 .venv/
 .chainlit/
 .files/
-# Ignore all files in the static directory for now
-app/static/*
 
 .env
 qu.txt
 chainlit.md
+STRUCTURE.md
 *.ipynb
 
 __pycache__/
+
+# Python packaging
+*.egg-info/
+build/
+dist/
+
+# Frontend (TypeScript)
+node_modules/
+frontend/dist/
