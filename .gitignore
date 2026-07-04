@@ -1,9 +1,10 @@
 # Local data: vector DB, checkpoints, transcripts, eval CSVs
-/data/
+/data/*
 YT project/
 .venv/
 .chainlit/
 .files/
+.pytest_cache/
 
 .env
 qu.txt

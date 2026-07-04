@@ -105,9 +105,11 @@ class VideoList: # pylint: disable=too-many-instance-attributes, too-few-public-
 
 
 class RAGEvaluator:
-    """Local RAG evaluator using Gemini-as-judge, CSV output + DataFrame (no RAGAS/LangSmith).
+    """Local RAG evaluator using an LLM-as-judge, CSV output + DataFrame (no RAGAS/LangSmith).
 
-    Metrics (all scored 0.0 to 1.0 by Gemini):
+    The judge is whatever MAIN_MODEL is configured (provider-agnostic).
+
+    Metrics (all scored 0.0 to 1.0 by the judge):
         Precision    : are the retrieved chunks relevant to the question?
         Recall       : does the context cover the reference answer?
         Faithfulness : is the answer grounded in the context (no hallucinations)?
@@ -133,6 +135,12 @@ class RAGEvaluator:
     # ------------------------------------------------------------------
 
     def _load_examples(self) -> list[dict]:
+        if not self.QUESTIONS_PATH.exists():
+            raise FileNotFoundError(
+                f"Evaluation questions file not found: {self.QUESTIONS_PATH}. "
+                "Create it with 'question' and 'answer' columns "
+                "(one row per eval example) before running the evaluator."
+            )
         df = pd.read_csv(self.QUESTIONS_PATH)
         return df[["question", "answer"]].to_dict(orient="records")
 
@@ -160,7 +168,7 @@ class RAGEvaluator:
         return {"answer": result["messages"][-1].content, "contexts": contexts}
 
     def _score(self, prompt: str) -> float:
-        """Send a scoring prompt to Gemini, parse back a 0-1 float."""
+        """Send a scoring prompt to the judge model, parse back a 0-1 float."""
         response = self.llm.invoke([
             {
                 "role": "system",
@@ -172,8 +180,16 @@ class RAGEvaluator:
             },
             {"role": "user", "content": prompt}
         ])
+        # content is a plain string on some providers and a list of content
+        # blocks on others (e.g. Gemini); normalise to text before parsing.
+        content = response.content
+        if isinstance(content, list):
+            content = "".join(
+                block.get("text", "") if isinstance(block, dict) else str(block)
+                for block in content
+            )
         try:
-            return round(float(response.content[-1]["text"].strip()), 3)
+            return round(float(content.strip()), 3)
         except ValueError:
             return 0.0
 
@@ -290,9 +306,6 @@ Answer: {answer}
             print(f"""
                        P={rows[-1]['Precision']}  R={rows[-1]['Recall']}
                        F={rows[-1]['Faithfulness']}  Rel={rows[-1]['Relevance']}""")
-
-            with open('res.txt', 'a', encoding='utf-8') as a:
-                a.write(f"CONTEXTS:, {out['contexts']}\nANSWER:, {out['answer']}\n\n")
 
         df = pd.DataFrame(rows)
 
