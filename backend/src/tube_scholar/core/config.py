@@ -13,11 +13,16 @@ land in ``os.environ`` where the SDKs look for them. (pydantic-settings alone
 reads ``.env`` into this object, not into ``os.environ``.)
 """
 
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Load .env into os.environ so provider SDKs (OpenAI/Anthropic/Google) find their keys.
-load_dotenv()
+# usecwd=True makes the search start from the directory the app RUNS from (like the
+# env_file below does), not from this file's location. That distinction only bites
+# when the package is installed non-editable (e.g. in Docker): this file then lives
+# in site-packages, and the default search would walk up from there and miss the
+# real .env entirely.
+load_dotenv(find_dotenv(usecwd=True))
 
 
 class Settings(BaseSettings):

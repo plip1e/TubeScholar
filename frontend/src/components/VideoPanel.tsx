@@ -138,7 +138,7 @@ export function VideoPanel({
 
       {backendDown && (
         <p className="ingest-status fail">
-          Can't reach the backend. Is uvicorn running on :8000?
+          Couldn't load the video list from the backend. Check the server logs.
         </p>
       )}
 
