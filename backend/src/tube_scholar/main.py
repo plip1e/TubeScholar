@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from tube_scholar import __version__
-from tube_scholar.api import chat, ingest
+from tube_scholar.api import chat, ingest, videos
 
 app = FastAPI(title="TubeScholar API", version=__version__)
 
@@ -26,9 +26,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount the routers. Each router already carries its own prefix (/chat, /ingest).
+# Mount the routers. Each router already carries its own prefix (/chat, /ingest, /videos).
 app.include_router(chat.router)
 app.include_router(ingest.router)
+app.include_router(videos.router)
 
 
 @app.get("/health", tags=["meta"])

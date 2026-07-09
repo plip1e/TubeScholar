@@ -1,0 +1,359 @@
+/* Dark theme with a red accent (YouTube-inspired).
+   Design tokens live on :root as CSS variables, so retheming is a
+   five-line change instead of a find-and-replace. */
+:root {
+  --bg: #0f0f0f;
+  --bg-raised: #1f1f1f;
+  --bg-input: #2a2a2a;
+  --border: #333333;
+  --text: #f1f1f1;
+  --text-dim: #9e9e9e;
+  --accent: #ff0033;
+  --accent-soft: rgba(255, 0, 51, 0.12);
+  --ok: #4caf7d;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  line-height: 1.5;
+}
+
+#root,
+.app {
+  height: 100vh;
+}
+
+/* --- layout: sidebar | chat ------------------------------------------- */
+
+.app {
+  display: flex;
+}
+
+.video-panel {
+  width: 300px;
+  flex-shrink: 0;
+  border-left: 1px solid var(--border);
+  background: var(--bg-raised);
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  overflow-y: auto;
+  overflow-x: hidden; /* contents don't spill mid-transition */
+  transition: width 0.2s ease;
+}
+
+/* Collapsed: a thin clickable rail on the right edge. */
+.video-panel.collapsed {
+  width: 48px;
+  padding: 0.75rem 0;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+  user-select: none;
+}
+
+.video-panel.collapsed:hover {
+  background: var(--bg-input);
+}
+
+.rail-chevron {
+  color: var(--text-dim);
+  font-size: 0.7rem;
+}
+
+.video-panel.collapsed:hover .rail-chevron {
+  color: var(--accent);
+}
+
+.rail-icon {
+  font-size: 1.1rem;
+}
+
+.rail-count {
+  background: var(--accent);
+  color: #fff;
+  font-size: 0.72rem;
+  font-weight: 600;
+  border-radius: 999px;
+  min-width: 1.4em;
+  padding: 0.1em 0.35em;
+  text-align: center;
+}
+
+.rail-warn {
+  color: var(--accent);
+}
+
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.panel-toggle {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 0.75rem;
+  cursor: pointer;
+  padding: 0.25rem 0.5rem;
+  border-radius: 0.4rem;
+}
+
+.panel-toggle:hover {
+  color: var(--accent);
+  background: var(--bg-input);
+}
+
+.chat-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0; /* lets the chat column shrink instead of overflowing */
+}
+
+/* --- header ------------------------------------------------------------ */
+
+.chat-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.75rem 1.25rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.chat-header h1 {
+  font-size: 1.15rem;
+  margin: 0;
+  letter-spacing: -0.02em;
+}
+
+.accent {
+  color: var(--accent);
+}
+
+.ghost-button {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 0.35rem 0.9rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.ghost-button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.ghost-button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* --- chat window --------------------------------------------------------- */
+
+.chat-window {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.empty-state {
+  margin: auto;
+  max-width: 26rem;
+  text-align: center;
+  color: var(--text-dim);
+}
+
+.empty-title {
+  color: var(--text);
+  font-size: 1.2rem;
+  font-weight: 600;
+}
+
+.bubble-row {
+  display: flex;
+}
+
+.bubble-row.user {
+  justify-content: flex-end;
+}
+
+.bubble {
+  max-width: 72%;
+  padding: 0.6rem 0.9rem;
+  border-radius: 1rem;
+  white-space: pre-wrap; /* keep the model's line breaks */
+  overflow-wrap: break-word;
+}
+
+.bubble.user {
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  border-bottom-right-radius: 0.25rem;
+}
+
+.bubble.assistant {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-bottom-left-radius: 0.25rem;
+}
+
+.bubble.error {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.cursor {
+  animation: blink 1s steps(1) infinite;
+  color: var(--accent);
+}
+
+@keyframes blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+/* --- composer ------------------------------------------------------------ */
+
+.composer {
+  display: flex;
+  gap: 0.5rem;
+  padding: 1rem 1.25rem;
+  border-top: 1px solid var(--border);
+}
+
+.composer input {
+  flex: 1;
+}
+
+input {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text);
+  padding: 0.6rem 1rem;
+  font-size: 0.95rem;
+  outline: none;
+}
+
+input:focus {
+  border-color: var(--accent);
+}
+
+input::placeholder {
+  color: var(--text-dim);
+}
+
+button[type="submit"] {
+  background: var(--accent);
+  border: none;
+  border-radius: 999px;
+  color: #fff;
+  font-weight: 600;
+  padding: 0.6rem 1.2rem;
+  cursor: pointer;
+}
+
+button[type="submit"]:hover:not(:disabled) {
+  filter: brightness(1.15);
+}
+
+button[type="submit"]:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* --- video sidebar --------------------------------------------------------- */
+
+.video-panel h2 {
+  margin: 0;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+}
+
+.ingest-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.ingest-form input {
+  border-radius: 0.5rem;
+  width: 100%;
+}
+
+.ingest-status {
+  margin: 0;
+  font-size: 0.8rem;
+}
+
+.ingest-status.ok {
+  color: var(--ok);
+}
+
+.ingest-status.fail {
+  color: var(--accent);
+}
+
+.video-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.video-empty {
+  color: var(--text-dim);
+  font-size: 0.85rem;
+}
+
+.video-item {
+  padding: 0.5rem 0.6rem;
+  border-radius: 0.5rem;
+  display: flex;
+  flex-direction: column;
+}
+
+.video-item:hover {
+  background: var(--bg-input);
+}
+
+.video-item a {
+  color: var(--text);
+  text-decoration: none;
+  font-size: 0.9rem;
+  font-weight: 500;
+  /* clamp long titles to two lines */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.video-item a:hover {
+  color: var(--accent);
+}
+
+.video-meta {
+  color: var(--text-dim);
+  font-size: 0.78rem;
+}

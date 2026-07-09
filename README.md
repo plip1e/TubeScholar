@@ -55,7 +55,7 @@ Retrieval can already be scoped to a single `video_id`, and the corpus is fully 
 
 TubeScholar is a **multi-agent system** built on a LangGraph `StateGraph`. An intent classifier routes each turn before it reaches the supervisor, so cheap social turns skip retrieval entirely. The supervisor then coordinates sub-agents (retrieval, verification, relevance grading, trust scoring) instead of running everything through a single monolithic chain.
 
-The same graph is driven by two front ends: a **Chainlit** chat UI (working today) and a **FastAPI** backend that streams answers over Server-Sent Events (in progress, see below). The graph is built lazily, so importing the app has no side effects and needs no API keys.
+The same graph is driven by two front ends: a **React (TypeScript)** web app talking to a **FastAPI** backend that streams answers over Server-Sent Events, and a **Chainlit** chat UI kept around as a quick debug surface. The graph is built lazily, so importing the app has no side effects and needs no API keys.
 
 This diagram shows the finished shape of the system (planned nodes included):
 
@@ -76,7 +76,7 @@ User query
            '--> Trust scorer        --> reputation + attribution + confidence  (planned)
                     |
                     v
-           Grounded, trust-annotated answer --> Chainlit / FastAPI (token-streamed)
+           Grounded, trust-annotated answer --> FastAPI (SSE) --> React UI / Chainlit
 ```
 
 Transcripts are ingested via `youtube-transcript-api` (through rotating proxies), chunked, embedded, and persisted in ChromaDB. When a video has no captions, the pipeline falls back to a metadata and top-comments overview (clearly labelled as inferred). An `openai-whisper` speech-to-text path exists but is gated off by default while audio transcription is offloaded to an external service.
@@ -100,13 +100,14 @@ Google ships as a bundled dependency; OpenAI and Anthropic are optional extras (
 
 ## ✅ Current Progress
 
-- **Installable package and API**: the backend is a src-layout Python package (`tube_scholar`) installed in editable mode. A **FastAPI** backend exposes `/health` and a token-streaming `/chat` endpoint, sharing the exact same LangGraph as the Chainlit UI.
+- **Installable package and API**: the backend is a src-layout Python package (`tube_scholar`) installed in editable mode. A **FastAPI** backend exposes `/health`, a token-streaming `/chat` endpoint, `/ingest` (video ingestion over HTTP), and `/videos` (the ingested library) — sharing the exact same LangGraph and pipeline as every other surface.
+- **Web UI**: a **Vite + React + TypeScript** single-page app with token-by-token streaming chat (`fetch` + `ReadableStream` over SSE) and a collapsible video-library panel with URL ingestion. The panel auto-refreshes after each answer, so videos the agent ingests mid-conversation appear immediately.
 - **Provider-agnostic LLM stack**: chat via `init_chat_model` and embeddings via `init_embeddings`, chosen by a `provider:model` prefix, with per-provider API keys and a clear error message when a key is missing.
 - **Ingestion pipeline**: YouTube Data API metadata, caption retrieval through Webshare rotating proxies, concurrent multi-URL ingestion on a bounded thread pool with per-thread HTTP clients (thread-safe), word-window chunking, embeddings, and persistent ChromaDB storage. Deterministic chunk IDs give idempotent re-ingestion, a 7-day staleness check skips up-to-date videos, and an in-memory registry is rebuilt from the store on startup.
 - **Graceful failure handling**: every tool returns an agent-readable status dict (invalid URL, not found, quota/blocked, transcript unavailable, empty transcript) instead of crashing the run, including a metadata and top-comments fallback when no transcript exists.
 - **Agent graph**: structured intent classification, a direct chitchat path, and a `langgraph_supervisor` supervisor wired with the full pipeline toolset plus the verification sub-agent. Conversation history is token-capped per thread and persisted via an async SQLite checkpointer.
 - **Verification agent**: a tool-using agent backed by a Wikidata/Wikipedia client (`get_profile`, `search_person`, `get_property`, `humanise_qid`, `wiki_search`) that reports the sources it checked back to the supervisor.
-- **Streaming UI**: a Chainlit chat frontend with subgraph-aware token filtering, so only user-facing answer tokens are streamed (internal proof-reading stays hidden).
+- **Answer-only streaming**: subgraph-aware token filtering shared by both front ends, so only user-facing answer tokens are streamed (internal proof-reading stays hidden).
 - **Evaluation harness**: a local LLM-as-judge `RAGEvaluator` scoring precision, recall, faithfulness, and relevance, with versioned CSV output and LangSmith tracing.
 
 ---
@@ -124,7 +125,7 @@ Google ships as a bundled dependency; OpenAI and Anthropic are optional extras (
 | **Video metadata / search** | YouTube Data API v3 |
 | **External fact-checking** | Wikidata + Wikipedia APIs |
 | **Evaluation and tracing** | LangSmith tracing + custom LLM-as-judge `RAGEvaluator` |
-| **Frontend** | Chainlit (working prototype); a Vite + React frontend over the FastAPI backend is planned |
+| **Frontend** | Vite + React + TypeScript SPA (streaming chat + video library); Chainlit kept as a debug UI |
 | **Proxies** | Webshare (rotating, to avoid IP bans during ingestion) |
 
 ---
@@ -134,6 +135,7 @@ Google ships as a bundled dependency; OpenAI and Anthropic are optional extras (
 ### Prerequisites
 
 - Python 3.11+
+- Node.js 18+ (for the web frontend)
 - An API key for your chosen provider (default is Google Gemini via [Google AI Studio](https://aistudio.google.com/), free tier is fine for development). For OpenAI or Anthropic, use their key instead.
 - A YouTube Data API v3 key
 - (Optional) Webshare credentials for rotating proxies
@@ -187,19 +189,9 @@ WHISPER_ENABLED=0                # set to 1 to enable the local Whisper caption 
 # CHECKPOINT_DB=data/checkpoints.sqlite
 ```
 
-### Run (Chainlit chat UI)
+### Run (web app: FastAPI + React)
 
-This is the working front end today. From the project root:
-
-```bash
-chainlit run backend/src/tube_scholar/chainlit_app.py
-```
-
-Then open the printed `http://localhost:8000` link in your browser. Avoid the `-w` watch flag here: the SQLite checkpointer writes to `data/` on every turn, and the watcher would treat that as a code change and reload the app mid-request. Only use `-w` while actively editing the app's code.
-
-### Run (FastAPI backend)
-
-The HTTP backend runs the same graph and streams answers over Server-Sent Events.
+This is the main front end. Start the backend from the project root:
 
 ```bash
 tubescholar
@@ -207,13 +199,34 @@ tubescholar
 uvicorn tube_scholar.main:app --reload --app-dir backend/src
 ```
 
+Then start the frontend dev server:
+
+```bash
+cd frontend
+npm install          # first time only
+npm run dev
+```
+
+Open `http://localhost:5173` — a streaming chat with a collapsible video-library panel (top right). Vite proxies `/api/*` to the backend on `:8000`, so no CORS setup is needed in dev. See [frontend/README.md](frontend/README.md) for details.
+
 Interactive API docs are auto-generated at `http://localhost:8000/docs`.
 
 | Endpoint | Method | Status | Description |
 |----------|--------|--------|-------------|
 | `/health` | GET | Working | Liveness probe. Returns status and version. |
 | `/chat` | POST | Working | Streams the answer token by token over SSE. Body: `{"message": "...", "thread_id": "..."}`. |
-| `/ingest` | POST | Stub | Placeholder for video ingestion over HTTP. The pipeline is wired into Chainlit today and will be connected here next. |
+| `/ingest` | POST | Working | Ingests a YouTube video over HTTP. Body: `{"url": "..."}`. Returns the pipeline's status dict. |
+| `/videos` | GET | Working | Lists every ingested video's metadata, ordered by placement. |
+
+### Run (Chainlit debug UI)
+
+The original prototype UI, kept as a quick debug surface over the same graph. Run it *instead of* the FastAPI backend (both default to port 8000):
+
+```bash
+chainlit run backend/src/tube_scholar/chainlit_app.py
+```
+
+Then open the printed `http://localhost:8000` link in your browser. Avoid the `-w` watch flag here: the SQLite checkpointer writes to `data/` on every turn, and the watcher would treat that as a code change and reload the app mid-request. Only use `-w` while actively editing the app's code.
 
 ---
 
@@ -233,13 +246,17 @@ TubeScholar/
         models.py           provider-agnostic chat-model construction
       api/
         chat.py             POST /chat  (SSE streaming)
-        ingest.py           POST /ingest (stub)
+        ingest.py           POST /ingest (video ingestion over HTTP)
+        videos.py           GET /videos (the ingested library)
       agents.py             the verification agent
       func.py               state, intent classifier, WikiVerifier, RAGEvaluator
       video_ingestion.py    the YouTube ingestion pipeline
     tests/                  pytest suite
     notebooks/              experiments and scratch work
-  frontend/                 planned Vite + React single-page app
+  frontend/                 Vite + React + TypeScript single-page app
+    src/App.tsx             state owner (chat, videos, panel)
+    src/api/client.ts       fetch wrappers + SSE stream reader
+    src/components/         ChatWindow, MessageBubble, Composer, VideoPanel
   data/                     local vector DB, checkpoints, transcripts (gitignored)
 ```
 
@@ -261,10 +278,10 @@ Evaluation is treated as a **first-class signal**, not an afterthought.
 ## 🗺️ Roadmap
 
 **Stretch goals**
+- [x] Connect the `/ingest` endpoint and round out the FastAPI surface
+- [x] Vite + React frontend over the FastAPI backend
 - [ ] Channel reputation scoring and a blended, explained trust score
 - [ ] Dedicated relevance-grading agent and explicit usage-mode selector
-- [ ] Connect the `/ingest` endpoint and round out the FastAPI surface
-- [ ] Vite + React frontend over the FastAPI backend
 - [ ] Deployment via Hugging Face Spaces or a VPS
 - [ ] Chrome extension
 
