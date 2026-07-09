@@ -11,7 +11,7 @@ client = TestClient(app)
 
 
 def test_health_ok():
-    resp = client.get("/health")
+    resp = client.get("/api/health")
     assert resp.status_code == 200
     assert resp.json()["status"] == "ok"
 
@@ -20,5 +20,6 @@ def test_routes_registered():
     # Prove the real endpoints are wired without invoking the LLM/graph (which needs
     # API keys). We just check the route table.
     paths = {route.path for route in app.routes}
-    assert "/chat" in paths
-    assert "/ingest" in paths
+    assert "/api/chat" in paths
+    assert "/api/ingest" in paths
+    assert "/api/videos" in paths

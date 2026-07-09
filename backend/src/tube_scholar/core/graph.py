@@ -5,7 +5,7 @@ This is the brain of the app, lifted out of the old Chainlit ``app.py``. It buil
     START -> classify -> route -> (chitchat | supervisor) -> END
 
 Everything is built **lazily** (on first ``get_graph()`` call) rather than at import
-time, so importing this module — and therefore booting the FastAPI app — is cheap and
+time, so importing this module (and therefore booting the FastAPI app) is cheap and
 doesn't require API keys or a network connection. The Chainlit UI and the FastAPI
 ``/chat`` endpoint both consume the graph built here, so the logic lives in one place.
 """
@@ -44,7 +44,7 @@ def get_llm():
 
     Provider-agnostic: the provider is read from the ``MAIN_MODEL`` prefix
     (openai:/anthropic:/google_genai:) and that provider's SDK reads its own API
-    key from the environment — so no key is passed explicitly here.
+    key from the environment, so no key is passed explicitly here.
     """
     global _llm  # pylint: disable=global-statement
     if _llm is None:
@@ -164,7 +164,7 @@ def _get_builder() -> StateGraph:
         return _builder
 
     # Imported here (not at module top) so importing this module doesn't construct the
-    # verification agent's LLM — keeps app boot cheap and key-free.
+    # verification agent's LLM, which keeps app boot cheap and key-free.
     from tube_scholar.agents import verification_agent  # pylint: disable=import-outside-toplevel
 
     supervisor = create_supervisor(

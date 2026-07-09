@@ -4,8 +4,8 @@ The TubeScholar web UI: a chat window that streams the agent's answers
 token-by-token, plus a sidebar listing ingested videos with a form to ingest
 new ones.
 
-Built with **Vite 5** + **React 18** + **TypeScript** (Vite is pinned to v5 —
-newer majors require Node 20+, this machine runs Node 18).
+Built with **Vite 5** + **React 18** + **TypeScript** (Vite is pinned to v5
+because newer majors require Node 20+ and this machine runs Node 18).
 
 ## Run it (dev)
 
@@ -52,5 +52,8 @@ tokens from an async generator that `App.tsx` consumes with `for await`.
 
 ```bash
 npm run build        # type-checks (tsc) then bundles to dist/
-npm run preview      # serve the built bundle locally
 ```
+
+In production there is no Node server: FastAPI serves `dist/` itself at `/`
+(see `static_dir` in the backend settings), so the frontend and API are
+same-origin and the Vite proxy only exists in dev.

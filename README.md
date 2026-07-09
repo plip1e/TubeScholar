@@ -1,3 +1,14 @@
+---
+title: TubeScholar
+emoji: 🎓
+colorFrom: red
+colorTo: gray
+sdk: docker
+app_port: 7860
+pinned: false
+license: apache-2.0
+---
+
 # 🎓 TubeScholar
 
 > A trustworthy research assistant for YouTube, not just another summarizer.
@@ -100,7 +111,7 @@ Google ships as a bundled dependency; OpenAI and Anthropic are optional extras (
 
 ## ✅ Current Progress
 
-- **Installable package and API**: the backend is a src-layout Python package (`tube_scholar`) installed in editable mode. A **FastAPI** backend exposes `/health`, a token-streaming `/chat` endpoint, `/ingest` (video ingestion over HTTP), and `/videos` (the ingested library) — sharing the exact same LangGraph and pipeline as every other surface.
+- **Installable package and API**: the backend is a src-layout Python package (`tube_scholar`) installed in editable mode. A **FastAPI** backend exposes `/health`, a token-streaming `/chat` endpoint, `/ingest` (video ingestion over HTTP), and `/videos` (the ingested library), all sharing the exact same LangGraph and pipeline as every other surface.
 - **Web UI**: a **Vite + React + TypeScript** single-page app with token-by-token streaming chat (`fetch` + `ReadableStream` over SSE) and a collapsible video-library panel with URL ingestion. The panel auto-refreshes after each answer, so videos the agent ingests mid-conversation appear immediately.
 - **Provider-agnostic LLM stack**: chat via `init_chat_model` and embeddings via `init_embeddings`, chosen by a `provider:model` prefix, with per-provider API keys and a clear error message when a key is missing.
 - **Ingestion pipeline**: YouTube Data API metadata, caption retrieval through Webshare rotating proxies, concurrent multi-URL ingestion on a bounded thread pool with per-thread HTTP clients (thread-safe), word-window chunking, embeddings, and persistent ChromaDB storage. Deterministic chunk IDs give idempotent re-ingestion, a 7-day staleness check skips up-to-date videos, and an in-memory registry is rebuilt from the store on startup.
@@ -207,16 +218,18 @@ npm install          # first time only
 npm run dev
 ```
 
-Open `http://localhost:5173` — a streaming chat with a collapsible video-library panel (top right). Vite proxies `/api/*` to the backend on `:8000`, so no CORS setup is needed in dev. See [frontend/README.md](frontend/README.md) for details.
+Open `http://localhost:5173` to get a streaming chat with a collapsible video-library panel (top right). Vite proxies `/api/*` to the backend on `:8000`, so no CORS setup is needed in dev. See [frontend/README.md](frontend/README.md) for details.
 
 Interactive API docs are auto-generated at `http://localhost:8000/docs`.
 
 | Endpoint | Method | Status | Description |
 |----------|--------|--------|-------------|
-| `/health` | GET | Working | Liveness probe. Returns status and version. |
-| `/chat` | POST | Working | Streams the answer token by token over SSE. Body: `{"message": "...", "thread_id": "..."}`. |
-| `/ingest` | POST | Working | Ingests a YouTube video over HTTP. Body: `{"url": "..."}`. Returns the pipeline's status dict. |
-| `/videos` | GET | Working | Lists every ingested video's metadata, ordered by placement. |
+| `/api/health` | GET | Working | Liveness probe. Returns status and version. |
+| `/api/chat` | POST | Working | Streams the answer token by token over SSE. Body: `{"message": "...", "thread_id": "..."}`. |
+| `/api/ingest` | POST | Working | Ingests a YouTube video over HTTP. Body: `{"url": "..."}`. Returns the pipeline's status dict. |
+| `/api/videos` | GET | Working | Lists every ingested video's metadata, ordered by placement. |
+
+In production there is no separate frontend server: `npm run build` produces static files in `frontend/dist/`, and FastAPI serves them at `/` (same origin as the API, so no CORS anywhere). See the Deployment section below.
 
 ### Run (Chainlit debug UI)
 
@@ -261,6 +274,23 @@ TubeScholar/
 ```
 
 Run the test suite with `pytest` (after installing the `dev` extra).
+
+---
+
+## ☁️ Deployment (Hugging Face Spaces)
+
+The repo is deploy-ready for a **Docker Space**: the YAML front matter at the top of this README declares the Space config (`sdk: docker`, `app_port: 7860`), and the `Dockerfile` builds the frontend, installs the backend, and runs everything as one container on port 7860.
+
+1. Create a Space at huggingface.co → New Space → SDK: **Docker** (blank template).
+2. In the Space's **Settings → Variables and secrets**, add the secrets: `GOOGLE_API_KEY`, `YOUTUBE_API_KEY`, and (recommended, transcripts fail from datacenter IPs without them) `WEBSHARE_PROXY_USERNAME` / `WEBSHARE_PROXY_PASSWORD`.
+3. Push this repo to the Space:
+   ```bash
+   git remote add space https://huggingface.co/spaces/<user>/<space>
+   git push space main
+   ```
+   HF builds the Dockerfile and serves the app at `https://<user>-<space>.hf.space`.
+
+Two free-tier caveats: the disk is **ephemeral** (the video library resets on every restart; the Dockerfile has a commented-out option to bake a seed corpus into the image), and the Space **sleeps after ~48h without traffic** (first visitor pays a cold start). The paid persistent-storage add-on mounts at `/data`; point `CHROMA_DIR` and `CHECKPOINT_DB` there via Space variables to keep the library across restarts.
 
 ---
 

@@ -1,7 +1,7 @@
 /** Shared shapes for talking to the backend.
  *
  * These mirror the backend's Pydantic models / dicts by hand. TypeScript can't
- * see Python, so if a backend field changes, this file must change with it —
+ * see Python, so if a backend field changes, this file must change with it:
  * one place to look, same idea as Pydantic being the single source of truth
  * on the other side.
  */
@@ -14,7 +14,7 @@ export interface ChatMessage {
   error?: boolean;
 }
 
-/** What GET /videos returns per video — mirrors VideoList.as_dict() in func.py. */
+/** What GET /videos returns per video; mirrors VideoList.as_dict() in func.py. */
 export interface VideoInfo {
   lst_placement: number;
   video_id: string;
@@ -30,7 +30,7 @@ export interface VideoInfo {
   duration: string | null;
 }
 
-/** What POST /ingest returns — the pipeline's status dict.
+/** What POST /ingest returns: the pipeline's status dict.
  * `status` is "ingested" | "skipped" on success, or a named failure
  * ("invalid_url", "not_found", "transcript_unavailable", "error", ...). */
 export interface IngestResult {

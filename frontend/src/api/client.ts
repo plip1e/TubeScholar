@@ -1,11 +1,11 @@
 /** All communication with the FastAPI backend lives here.
  *
- * Every call goes to /api/... — in dev, Vite's proxy (vite.config.ts) forwards
- * that to the backend on :8000 and strips the /api prefix.
+ * Every call goes to an /api/... path. In dev, Vite's proxy (vite.config.ts)
+ * forwards those to the backend on :8000.
  *
  * The interesting one is streamChat(): the backend streams the answer as
  * Server-Sent Events (SSE). The browser's built-in EventSource class only
- * supports GET, and our endpoint is a POST — so we read the response body
+ * supports GET, and our endpoint is a POST, so we read the response body
  * ourselves with fetch() + ReadableStream and parse the SSE wire format by
  * hand. It's ~20 lines and worth understanding, because this is all SSE is:
  * a long-lived HTTP response whose body arrives in pieces.
@@ -41,7 +41,7 @@ export async function* streamChat(
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
-  // Network chunks split anywhere — even mid-character — so we accumulate into
+  // Network chunks split anywhere, even mid-character, so we accumulate into
   // a buffer and only consume complete events (terminated by a blank line).
   let buffer = "";
 
@@ -51,7 +51,7 @@ export async function* streamChat(
     buffer += decoder.decode(value, { stream: true });
 
     const events = buffer.split(/\r?\n\r?\n/);
-    buffer = events.pop() ?? ""; // last piece may be incomplete — keep it
+    buffer = events.pop() ?? ""; // last piece may be incomplete, keep it
 
     for (const event of events) {
       for (const line of event.split(/\r?\n/)) {
@@ -65,7 +65,7 @@ export async function* streamChat(
 }
 
 /** Ask the backend to ingest a YouTube video. Resolves to the pipeline's
- * status dict either way — check `status`, don't try/catch for app errors. */
+ * status dict either way; check `status`, don't try/catch for app errors. */
 export async function ingestVideo(url: string): Promise<IngestResult> {
   const res = await fetch("/api/ingest", {
     method: "POST",

@@ -8,7 +8,7 @@ Provider API keys are intentionally NOT modelled here. TubeScholar is
 provider-agnostic: the ``MAIN_MODEL`` / ``EMBEDDING_MODEL`` strings carry a
 ``provider:model`` prefix, and each provider's SDK reads its own standard key from
 the environment (``OPENAI_API_KEY``, ``ANTHROPIC_API_KEY``, ``GOOGLE_API_KEY``).
-We call ``load_dotenv()`` below so those keys — living in ``.env`` during dev —
+We call ``load_dotenv()`` below so those keys (living in ``.env`` during dev)
 land in ``os.environ`` where the SDKs look for them. (pydantic-settings alone
 reads ``.env`` into this object, not into ``os.environ``.)
 """
@@ -43,6 +43,9 @@ class Settings(BaseSettings):
     # --- storage paths (relative to the project root / cwd the app runs from) ---
     chroma_dir: str = "data/chroma_db"              # CHROMA_DIR
     checkpoint_db: str = "data/checkpoints.sqlite"  # CHECKPOINT_DB
+
+    # --- built frontend (served by FastAPI when the directory exists) ---
+    static_dir: str = "frontend/dist"               # STATIC_DIR
 
     # --- feature flags ---
     whisper_enabled: int = 0             # WHISPER_ENABLED (1 = local audio transcription)

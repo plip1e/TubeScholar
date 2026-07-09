@@ -1,7 +1,7 @@
 """Chat endpoint.
 
 Streams the LangGraph's answer tokens to the frontend using **Server-Sent Events
-(SSE)**. This is the same graph the Chainlit UI uses — the only difference is the
+(SSE)**. This is the same graph the Chainlit UI uses; the only difference is the
 transport: instead of Chainlit's ``stream_token``, we emit SSE events that the
 browser reads with ``EventSource`` / ``fetch`` + ``ReadableStream``.
 

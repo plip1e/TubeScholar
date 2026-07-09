@@ -5,7 +5,7 @@ import { ChatWindow } from "./components/ChatWindow";
 import { Composer } from "./components/Composer";
 import { VideoPanel } from "./components/VideoPanel";
 
-/** Root component — owns all the state, children just render it.
+/** Root component. It owns all the state; children just render it.
  *
  * This "state lives at the top, flows down as props, events flow back up as
  * callbacks" shape is the standard React pattern; when the app grows past
@@ -19,7 +19,7 @@ export default function App() {
   const [threadId, setThreadId] = useState(() => crypto.randomUUID());
   const [videos, setVideos] = useState<VideoInfo[]>([]);
   const [backendDown, setBackendDown] = useState(false);
-  // Video panel visibility — collapsed to a thin rail by default.
+  // Video panel visibility, collapsed to a thin rail by default.
   const [panelOpen, setPanelOpen] = useState(false);
 
   const refreshVideos = useCallback(async () => {
@@ -68,7 +68,7 @@ export default function App() {
       });
     } finally {
       setStreaming(false);
-      // The agent can ingest videos mid-conversation — keep the sidebar honest.
+      // The agent can ingest videos mid-conversation, so keep the sidebar honest.
       refreshVideos();
     }
   }

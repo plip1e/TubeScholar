@@ -31,7 +31,7 @@ function statusMessage(result: IngestResult): string {
     case "invalid_url":
       return "That doesn't look like a YouTube URL.";
     case "not_found":
-      return "Video not found — it may be private or deleted.";
+      return "Video not found. It may be private or deleted.";
     case "transcript_unavailable":
       return "No transcript available for this video.";
     default:
@@ -43,7 +43,7 @@ function statusMessage(result: IngestResult): string {
  *
  * Collapses to a thin rail. Both branches below return an <aside> in the same
  * position, so React reuses the DOM node and the CSS width transition runs on
- * toggle — and this component never unmounts, so the form state (typed URL,
+ * toggle, and this component never unmounts, so the form state (typed URL,
  * ingest-in-progress) survives collapsing. */
 export function VideoPanel({
   videos,
@@ -84,7 +84,7 @@ export function VideoPanel({
   }
 
   if (!open) {
-    // The whole rail is one big button — easiest possible target to reopen.
+    // The whole rail is one big button: the easiest possible target to reopen.
     return (
       <aside
         className="video-panel collapsed"
@@ -138,7 +138,7 @@ export function VideoPanel({
 
       {backendDown && (
         <p className="ingest-status fail">
-          Can't reach the backend — is uvicorn running on :8000?
+          Can't reach the backend. Is uvicorn running on :8000?
         </p>
       )}
 

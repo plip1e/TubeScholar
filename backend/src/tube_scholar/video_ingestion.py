@@ -38,7 +38,7 @@ def collection_name_for(embedding_model: str) -> str:
 
     Different embedding models produce different-sized vectors, and a Chroma
     collection is locked to one dimension. Giving each embedding model its own
-    collection means switching providers can't corrupt an existing index — each
+    collection means switching providers can't corrupt an existing index: each
     keeps its own. Re-ingest once per embedding model you use.
     '''
     slug = re.sub(r"[^a-z0-9]+", "_", embedding_model.lower()).strip("_")
@@ -46,8 +46,9 @@ def collection_name_for(embedding_model: str) -> str:
 
 WS_USERNAME = os.getenv("WEBSHARE_PROXY_USERNAME")
 WS_PASSWORD = os.getenv("WEBSHARE_PROXY_PASSWORD")
-# Anchored to a fixed location (relative to where the app is launched — the project
-# root) rather than to __file__, so moving this module doesn't repoint the vector DB.
+# Anchored to a fixed location (relative to where the app is launched, i.e. the
+# project root) rather than to __file__, so moving this module doesn't repoint the
+# vector DB.
 CHROMA_DIR = os.getenv("CHROMA_DIR", "data/chroma_db")
 # Local Whisper speech-to-text is gated off by default (audio transcription is being
 # offloaded to an external Colab + FastAPI service). Set WHISPER_ENABLED=1 to re-enable.

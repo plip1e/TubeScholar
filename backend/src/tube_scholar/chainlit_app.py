@@ -1,4 +1,4 @@
-"""Chainlit UI — kept as a quick internal debug front-end during the migration.
+"""Chainlit UI, kept as a quick internal debug front-end during the migration.
 
 The heavy lifting (graph, nodes, streaming filter) now lives in
 ``tube_scholar.core.graph``; this file is just the Chainlit glue that streams the

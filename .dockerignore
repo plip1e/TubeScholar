@@ -1,0 +1,16 @@
+# Keep the build context small and secrets/junk out of the image.
+.git
+.venv
+.env
+data
+node_modules
+frontend/node_modules
+frontend/dist
+__pycache__
+*.egg-info
+.pytest_cache
+.chainlit
+.files
+notebooks
+*.ipynb
+YT project

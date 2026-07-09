@@ -2,7 +2,7 @@ import { useEffect, useRef } from "react";
 import type { ChatMessage } from "../types";
 import { MessageBubble } from "./MessageBubble";
 
-/** The scrolling message list. Purely presentational — all state lives in App. */
+/** The scrolling message list. Purely presentational; all state lives in App. */
 export function ChatWindow({
   messages,
   streaming,
@@ -24,7 +24,7 @@ export function ChatWindow({
           <p className="empty-title">Ask about any YouTube video</p>
           <p>
             Open the video panel (🎬, top right) to ingest a video by URL, or
-            just ask — the agent can search YouTube and ingest videos itself.
+            just ask: the agent can search YouTube and ingest videos itself.
           </p>
         </div>
       )}

@@ -3,11 +3,11 @@
 Wraps the shared VideoIngestionPipeline: accept a YouTube URL, pull the
 transcript, embed it, store it in Chroma. Uses the same lazy pipeline singleton
 as the graph (``get_pipeline``), so a video ingested here is immediately
-searchable by the agent — one store, two doors.
+searchable by the agent: one store, two doors.
 
 The pipeline is synchronous (network + embedding calls), so the handler runs it
-in FastAPI's threadpool via ``run_in_threadpool`` — otherwise it would block the
-event loop and freeze every other request (including in-flight chat streams).
+in FastAPI's threadpool via ``run_in_threadpool``, since otherwise it would block
+the event loop and freeze every other request (including in-flight chat streams).
 """
 
 from fastapi import APIRouter
