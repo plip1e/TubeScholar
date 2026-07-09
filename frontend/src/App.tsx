@@ -5,6 +5,17 @@ import { ChatWindow } from "./components/ChatWindow";
 import { Composer } from "./components/Composer";
 import { VideoPanel } from "./components/VideoPanel";
 
+/** Conversation-id generator. crypto.randomUUID() only exists in "secure
+ * contexts" (HTTPS or localhost); served over plain http://<ip> it is
+ * undefined and would crash the first render. The fallback just needs to be
+ * unique enough for a checkpoint key, not cryptographically strong. */
+function newThreadId(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+  return `t-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 /** Root component. It owns all the state; children just render it.
  *
  * This "state lives at the top, flows down as props, events flow back up as
@@ -16,7 +27,7 @@ export default function App() {
   const [streaming, setStreaming] = useState(false);
   // The LangGraph checkpoint key: one thread = one conversation memory.
   // A new id per page load (or "New chat") starts a fresh conversation.
-  const [threadId, setThreadId] = useState(() => crypto.randomUUID());
+  const [threadId, setThreadId] = useState(newThreadId);
   const [videos, setVideos] = useState<VideoInfo[]>([]);
   const [backendDown, setBackendDown] = useState(false);
   // Video panel visibility, collapsed to a thin rail by default.
@@ -82,7 +93,7 @@ export default function App() {
   }
 
   function newChat() {
-    setThreadId(crypto.randomUUID());
+    setThreadId(newThreadId());
     setMessages([]);
   }
 
