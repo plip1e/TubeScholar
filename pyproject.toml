@@ -1,6 +1,6 @@
 [project]
 name = "TubeScholar"
-version = "1.0.0"
+version = "1.0.1"
 requires-python = ">=3.11"
 dependencies = [
     # --- LLM / agent orchestration ---
