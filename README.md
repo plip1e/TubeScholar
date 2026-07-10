@@ -1,17 +1,8 @@
----
-title: TubeScholar
-emoji: 🎓
-colorFrom: red
-colorTo: gray
-sdk: docker
-app_port: 7860
-pinned: false
-license: apache-2.0
----
-
 # 🎓 TubeScholar
 
 > A trustworthy research assistant for YouTube, not just another summarizer.
+
+**v1.0.0 is live: [tubescholar.app](https://tubescholar.app)**
 
 TubeScholar turns YouTube videos into a **queryable, source-aware knowledge base**. Ask a question, get an answer grounded in the actual transcript, *plus* a transparent trust signal that tells you how much you should rely on the source it came from.
 
@@ -112,7 +103,8 @@ Google ships as a bundled dependency; OpenAI and Anthropic are optional extras (
 ## ✅ Current Progress
 
 - **Installable package and API**: the backend is a src-layout Python package (`tube_scholar`) installed in editable mode. A **FastAPI** backend exposes `/health`, a token-streaming `/chat` endpoint, `/ingest` (video ingestion over HTTP), and `/videos` (the ingested library), all sharing the exact same LangGraph and pipeline as every other surface.
-- **Web UI**: a **Vite + React + TypeScript** single-page app with token-by-token streaming chat (`fetch` + `ReadableStream` over SSE) and a collapsible video-library panel with URL ingestion. The panel auto-refreshes after each answer, so videos the agent ingests mid-conversation appear immediately.
+- **Web UI**: a **Vite + React + TypeScript** single-page app with token-by-token streaming chat (`fetch` + `ReadableStream` over SSE) and a collapsible video-library panel with URL ingestion. The panel auto-refreshes after each answer, so videos the agent ingests mid-conversation appear immediately. While the agent works, the answer bubble shows a live status line (searching transcripts, ingesting videos, fact-checking), and when verification forces a revision the draft is replaced on screen instead of duplicated.
+- **Production deployment**: live at [tubescholar.app](https://tubescholar.app). One Docker container (multi-stage build) on a Hetzner VPS behind a Caddy reverse proxy with automatic HTTPS; the video library persists in a named Docker volume.
 - **Provider-agnostic LLM stack**: chat via `init_chat_model` and embeddings via `init_embeddings`, chosen by a `provider:model` prefix, with per-provider API keys and a clear error message when a key is missing.
 - **Ingestion pipeline**: YouTube Data API metadata, caption retrieval through Webshare rotating proxies, concurrent multi-URL ingestion on a bounded thread pool with per-thread HTTP clients (thread-safe), word-window chunking, embeddings, and persistent ChromaDB storage. Deterministic chunk IDs give idempotent re-ingestion, a 7-day staleness check skips up-to-date videos, and an in-memory registry is rebuilt from the store on startup.
 - **Graceful failure handling**: every tool returns an agent-readable status dict (invalid URL, not found, quota/blocked, transcript unavailable, empty transcript) instead of crashing the run, including a metadata and top-comments fallback when no transcript exists.
@@ -137,6 +129,7 @@ Google ships as a bundled dependency; OpenAI and Anthropic are optional extras (
 | **External fact-checking** | Wikidata + Wikipedia APIs |
 | **Evaluation and tracing** | LangSmith tracing + custom LLM-as-judge `RAGEvaluator` |
 | **Frontend** | Vite + React + TypeScript SPA (streaming chat + video library); Chainlit kept as a debug UI |
+| **Deployment** | Docker (multi-stage image) + Caddy automatic HTTPS on a Hetzner VPS |
 | **Proxies** | Webshare (rotating, to avoid IP bans during ingestion) |
 
 ---
@@ -225,7 +218,7 @@ Interactive API docs are auto-generated at `http://localhost:8000/docs`.
 | Endpoint | Method | Status | Description |
 |----------|--------|--------|-------------|
 | `/api/health` | GET | Working | Liveness probe. Returns status and version. |
-| `/api/chat` | POST | Working | Streams the answer token by token over SSE. Body: `{"message": "...", "thread_id": "..."}`. |
+| `/api/chat` | POST | Working | Streams the turn over SSE: live status events (what the agent is doing), answer tokens, and a reset event when a fact-check revision replaces the draft. Body: `{"message": "...", "thread_id": "..."}`. |
 | `/api/ingest` | POST | Working | Ingests a YouTube video over HTTP. Body: `{"url": "..."}`. Returns the pipeline's status dict. |
 | `/api/videos` | GET | Working | Lists every ingested video's metadata, ordered by placement. |
 
@@ -277,20 +270,40 @@ Run the test suite with `pytest` (after installing the `dev` extra).
 
 ---
 
-## ☁️ Deployment (Hugging Face Spaces)
+## ☁️ Deployment
 
-The repo is deploy-ready for a **Docker Space**: the YAML front matter at the top of this README declares the Space config (`sdk: docker`, `app_port: 7860`), and the `Dockerfile` builds the frontend, installs the backend, and runs everything as one container on port 7860.
+TubeScholar runs in production at **[tubescholar.app](https://tubescholar.app)**: a single Docker container on a Hetzner VPS, behind a [Caddy](https://caddyserver.com) reverse proxy that provides automatic HTTPS. Nothing in the image is host-specific, so the same steps work on any Docker-capable server.
 
-1. Create a Space at huggingface.co → New Space → SDK: **Docker** (blank template).
-2. In the Space's **Settings → Variables and secrets**, add the secrets: `GOOGLE_API_KEY`, `YOUTUBE_API_KEY`, and (recommended, transcripts fail from datacenter IPs without them) `WEBSHARE_PROXY_USERNAME` / `WEBSHARE_PROXY_PASSWORD`.
-3. Push this repo to the Space:
-   ```bash
-   git remote add space https://huggingface.co/spaces/<user>/<space>
-   git push space main
-   ```
-   HF builds the Dockerfile and serves the app at `https://<user>-<space>.hf.space`.
+The `Dockerfile` is a multi-stage build: a Node stage compiles the React frontend, then a Python stage installs the backend package and serves both from one uvicorn process (port from the `PORT` env var, default 7860).
 
-Two free-tier caveats: the disk is **ephemeral** (the video library resets on every restart; the Dockerfile has a commented-out option to bake a seed corpus into the image), and the Space **sleeps after ~48h without traffic** (first visitor pays a cold start). The paid persistent-storage add-on mounts at `/data`; point `CHROMA_DIR` and `CHECKPOINT_DB` there via Space variables to keep the library across restarts.
+On a fresh Ubuntu server:
+
+```bash
+curl -fsSL https://get.docker.com | sh
+git clone https://github.com/plip1e/TubeScholar.git && cd TubeScholar
+# create .env here with GOOGLE_API_KEY, YOUTUBE_API_KEY, and (recommended,
+# transcript fetches fail from datacenter IPs without them)
+# WEBSHARE_PROXY_USERNAME / WEBSHARE_PROXY_PASSWORD
+
+docker build -t tubescholar .
+docker run -d --name tubescholar --restart unless-stopped \
+  -p 127.0.0.1:8080:7860 \
+  -v tubescholar-data:/app/data \
+  -v $PWD/.env:/app/.env:ro \
+  tubescholar
+```
+
+The named volume keeps the video library across rebuilds and reboots, and binding to `127.0.0.1` means the app is only reachable through the reverse proxy. For HTTPS, install Caddy and give it a two-line `/etc/caddy/Caddyfile` (it obtains and renews the Let's Encrypt certificate automatically):
+
+```
+tubescholar.app, www.tubescholar.app {
+	reverse_proxy localhost:8080
+}
+```
+
+DNS is two A records (the root and `www`) pointing at the server's IP. One note for `.app` domains: the entire TLD is HSTS-preloaded, so browsers refuse plain HTTP and the HTTPS step is mandatory, not optional.
+
+To update a running deployment: push to GitHub first, then on the server run `git pull`, rebuild the image, and re-run the container with the same command as above.
 
 ---
 
@@ -310,9 +323,9 @@ Evaluation is treated as a **first-class signal**, not an afterthought.
 **Stretch goals**
 - [x] Connect the `/ingest` endpoint and round out the FastAPI surface
 - [x] Vite + React frontend over the FastAPI backend
+- [x] Deployment on a VPS: live at [tubescholar.app](https://tubescholar.app) (v1.0.0)
 - [ ] Channel reputation scoring and a blended, explained trust score
 - [ ] Dedicated relevance-grading agent and explicit usage-mode selector
-- [ ] Deployment via Hugging Face Spaces or a VPS
 - [ ] Chrome extension
 
 ---
