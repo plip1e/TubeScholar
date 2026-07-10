@@ -57,13 +57,23 @@ export default function App() {
     ]);
     setStreaming(true);
     try {
-      for await (const token of streamChat(text, threadId)) {
+      for await (const ev of streamChat(text, threadId)) {
         // Functional update: React batches state changes, so we must derive
         // from the latest state (m), not from a stale `messages` closure.
         setMessages((m) => {
           const next = m.slice();
-          const last = next[next.length - 1];
-          next[next.length - 1] = { ...last, content: last.content + token };
+          const last = { ...next[next.length - 1] };
+          if (ev.type === "token") {
+            last.content += ev.text;
+            last.status = undefined; // answer text supersedes the status line
+          } else if (ev.type === "status") {
+            last.status = ev.text;
+          } else if (ev.type === "reset") {
+            // verification requested a revision: replace the draft
+            last.content = "";
+            last.status = "Revising the answer…";
+          }
+          next[next.length - 1] = last;
           return next;
         });
       }

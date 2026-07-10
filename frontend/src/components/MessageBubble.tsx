@@ -16,6 +16,9 @@ export function MessageBubble({
     <div className={`bubble-row ${message.role}`}>
       <div className={classes}>
         {message.content}
+        {active && !message.content && message.status && (
+          <span className="status-line">{message.status}</span>
+        )}
         {active && <span className="cursor">▍</span>}
       </div>
     </div>

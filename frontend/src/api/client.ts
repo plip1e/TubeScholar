@@ -11,24 +11,27 @@
  * a long-lived HTTP response whose body arrives in pieces.
  */
 
-import type { IngestResult, VideoInfo } from "../types";
+import type { ChatEvent, IngestResult, VideoInfo } from "../types";
 
-/** Stream the assistant's answer, one token at a time.
+/** Stream the assistant's turn as a series of typed events.
  *
- * Usage:  for await (const token of streamChat(text, threadId)) { ... }
+ * Usage:  for await (const ev of streamChat(text, threadId)) { ... }
  *
- * An async generator: each `yield` hands the caller one token as soon as it
+ * An async generator: each `yield` hands the caller one event as soon as it
  * arrives over the wire, and the function stays suspended in between. The
  * SSE wire format is text events separated by a blank line, each shaped like:
  *
- *     data: {"token": "..."}
+ *     data: {"status": "..."}   -> {type: "status"}  what the agent is doing
+ *     data: {"token": "..."}    -> {type: "token"}   a piece of the answer
+ *     data: {"reset": true}     -> {type: "reset"}   discard shown text, a
+ *                                                    revised answer follows
  *
  * with a final `data: {"done": true}` event when the answer is complete.
  */
 export async function* streamChat(
   message: string,
   threadId: string,
-): AsyncGenerator<string> {
+): AsyncGenerator<ChatEvent> {
   const res = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -58,7 +61,9 @@ export async function* streamChat(
         if (!line.startsWith("data:")) continue; // skip SSE comments/pings
         const payload = JSON.parse(line.slice("data:".length).trim());
         if (payload.done) return;
-        if (payload.token) yield payload.token;
+        if (payload.token) yield { type: "token", text: payload.token };
+        else if (payload.status) yield { type: "status", text: payload.status };
+        else if (payload.reset) yield { type: "reset" };
       }
     }
   }

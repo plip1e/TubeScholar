@@ -12,7 +12,16 @@ export interface ChatMessage {
   content: string;
   /** Set when the request itself failed (network/server), styled differently. */
   error?: boolean;
+  /** What the agent is doing right now (from a status event); shown while
+   * waiting for answer tokens. */
+  status?: string;
 }
+
+/** One event from the /api/chat SSE stream, as parsed by streamChat(). */
+export type ChatEvent =
+  | { type: "token"; text: string }
+  | { type: "status"; text: string }
+  | { type: "reset" };
 
 /** What GET /videos returns per video; mirrors VideoList.as_dict() in func.py. */
 export interface VideoInfo {
